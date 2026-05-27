@@ -845,40 +845,49 @@ public:
         std::string utf8Key = Encoding::SjisToUtf8(sjisMessage);
         if (utf8Key.empty()) return nullptr;
 
-        std::lock_guard<std::mutex> lock(m_dataMutex);
+        const std::string* result = nullptr;
+        std::string sceneFile, sceneLabel;
 
-        auto it = m_messages.find(utf8Key);
-        if (it != m_messages.end()) {
-            m_hitCount++;
+        {
+            std::lock_guard<std::mutex> lock(m_dataMutex);
+
+            auto it = m_messages.find(utf8Key);
+            if (it != m_messages.end()) {
+                result = &it->second;
+                m_hitCount++;
+
+                auto fileIt = m_messageToFile.find(utf8Key);
+                auto indexIt = m_messageToIndex.find(utf8Key);
+                if (fileIt != m_messageToFile.end() && indexIt != m_messageToIndex.end()) {
+                    sceneFile = fileIt->second;
+                    sceneLabel = GetNearestLabel(sceneFile, indexIt->second);
+                }
+            }
+        }
+
+        if (result) {
             {
                 std::lock_guard<std::mutex> slock(m_statsMutex);
                 m_usedKeys.insert(utf8Key);
             }
 
-            // Track current scene from matched message
-            auto fileIt = m_messageToFile.find(utf8Key);
-            auto indexIt = m_messageToIndex.find(utf8Key);
-            if (fileIt != m_messageToFile.end() && indexIt != m_messageToIndex.end()) {
-                std::string label = GetNearestLabel(fileIt->second, indexIt->second);
-
+            if (!sceneFile.empty()) {
                 std::lock_guard<std::mutex> sceneLock(g_sceneMutex);
-                if (g_currentFile != fileIt->second || g_currentLabel != label) {
-                    g_currentFile = fileIt->second;
-                    g_currentLabel = label;
-                    // Only log on scene change
-                    if (!label.empty()) {
+                if (g_currentFile != sceneFile || g_currentLabel != sceneLabel) {
+                    g_currentFile = sceneFile;
+                    g_currentLabel = sceneLabel;
+                    if (!sceneLabel.empty()) {
                         Log("[SCENE] %s | %s\n", g_currentFile.c_str(), g_currentLabel.c_str());
                     }
                 }
             }
 
-            // Update Discord Presence with current label
-            std::string display = g_currentLabel.c_str();
+            std::string display = sceneLabel;
             size_t bracket = display.rfind(" [");
             if (bracket != std::string::npos) display.erase(bracket);
             UpdateChapterPresence(display);
 
-            return &it->second;
+            return result;
         }
 
         m_missCount++;
@@ -933,18 +942,14 @@ public:
     }
 
     std::string GetNearestLabel(const std::string& file, int index) {
-        // Find highest label index <= message index
-        std::string bestLabel;
-        int bestIndex = -1;
-
-        for (const auto& [key, label] : m_labelsByFileIndex) {
-            if (key.first == file && key.second <= index && key.second > bestIndex) {
-                bestIndex = key.second;
-                bestLabel = label;
+        auto it = m_labelsByFileIndex.upper_bound(std::make_pair(file, index));
+        if (it != m_labelsByFileIndex.begin()) {
+            --it;
+            if (it->first.first == file) {
+                return it->second;
             }
         }
-
-        return bestLabel;
+        return "";
     }
 
     std::atomic<int> m_hitCount{0};
