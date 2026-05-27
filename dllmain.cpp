@@ -268,6 +268,8 @@ static void LoadConfig() {
 //=============================================================================
 
 static std::atomic<bool> g_discordRunning{false};
+static HANDLE g_discordThread = nullptr;
+static std::mutex g_discordMutex;
 static bool g_presenceTimerSet = false;
 static std::string g_currentChapter = "Loading...";
 static std::chrono::steady_clock::time_point g_presenceStartTime;
@@ -292,11 +294,14 @@ static void UpdateDiscordPresence() {
 
     DiscordRichPresence rp = {};
     rp.state          = "";
-    rp.details        = g_currentChapter.c_str();
+    std::string chapter;
+    {
+        std::lock_guard<std::mutex> lock(g_discordMutex);
+        chapter = g_currentChapter;
+    }
+    rp.details        = chapter.c_str();
     rp.largeImageKey  = "icon";
     rp.largeImageText = "";
-    // Optional: rp.smallImageKey = "playing"; etc.
-    // Only set startTimestamp once (when first showing presence)
     if (!g_presenceTimerSet) {
         auto now = std::chrono::system_clock::now();
         rp.startTimestamp = std::chrono::duration_cast<std::chrono::seconds>(
@@ -307,12 +312,14 @@ static void UpdateDiscordPresence() {
     Discord_UpdatePresence(&rp);
 }
 
-static void DiscordUpdateThread() {
+static DWORD WINAPI DiscordUpdateThreadProc(LPVOID) {
     while (g_discordRunning) {
         Discord_RunCallbacks();
         UpdateDiscordPresence();
-        std::this_thread::sleep_for(std::chrono::seconds(10));
+        for (int i = 0; i < 100 && g_discordRunning; i++)
+            Sleep(100);
     }
+    return 0;
 }
 
 static void InitDiscordRPC() {
@@ -325,16 +332,23 @@ static void InitDiscordRPC() {
     g_presenceStartTime = std::chrono::steady_clock::now();
     g_discordRunning = true;
 
-    std::thread(DiscordUpdateThread).detach();
+    g_discordThread = CreateThread(nullptr, 0, DiscordUpdateThreadProc, nullptr, 0, nullptr);
 
-    // Initial presence
-    g_currentChapter = "Loading...";
+    {
+        std::lock_guard<std::mutex> lock(g_discordMutex);
+        g_currentChapter = "Loading...";
+    }
     UpdateDiscordPresence();
 }
 
 static void ShutdownDiscordRPC() {
     if (!g_discordRunning) return;
     g_discordRunning = false;
+    if (g_discordThread) {
+        WaitForSingleObject(g_discordThread, 3000);
+        CloseHandle(g_discordThread);
+        g_discordThread = nullptr;
+    }
     g_presenceTimerSet = false;
     Discord_ClearPresence();
     Discord_Shutdown();
@@ -343,10 +357,13 @@ static void ShutdownDiscordRPC() {
 // Call this whenever chapter/label changes
 void UpdateChapterPresence(const std::string& chapterName) {
     if (!Config::enableDiscordPresence) return;
+    if (chapterName.empty()) return;
 
-    if (chapterName.empty() || chapterName == g_currentChapter) return;
-
-    g_currentChapter = chapterName;
+    {
+        std::lock_guard<std::mutex> lock(g_discordMutex);
+        if (chapterName == g_currentChapter) return;
+        g_currentChapter = chapterName;
+    }
     Log("[Discord] Updated chapter: %s\n", chapterName.c_str());
     UpdateDiscordPresence();
 }
@@ -1088,11 +1105,6 @@ public:
         return m_pool[str].c_str();
     }
 
-    void Clear() {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_pool.clear();
-    }
-
 private:
     std::unordered_map<std::string, std::string> m_pool;
     std::mutex m_mutex;
@@ -1178,7 +1190,6 @@ static DWORD WINAPI HotkeyThreadProc(LPVOID) {
         // Reload translations
         if (GetAsyncKeyState(Config::reloadHotkey) & 0x8000) {
             while (GetAsyncKeyState(Config::reloadHotkey) & 0x8000) Sleep(10);
-            g_stringPool.Clear();
             g_translationDB.Reload();
             MessageBeep(MB_OK);
         }
@@ -1370,7 +1381,7 @@ static void __fastcall PrintEx_Hook(
             std::string normalized = TextFix::NormalizeUtf8(*tlUtf8);
             std::string sjis = Encoding::Utf8ToSjis(normalized.c_str());
             if (!sjis.empty()) {
-                std::string wrapped = WordWrap::Wrap(sjis, Config::wordWrapWidth); // Apply word wrapping
+                std::string wrapped = WordWrap::Wrap(sjis, Config::wordWrapWidth);
                 finalMsg = g_stringPool.Store(wrapped);
             }
         }
@@ -1999,7 +2010,6 @@ static void ProcessDebugCommand(const std::string& cmd) {
         g_translationDB.PrintStats();
     }
     else if (verb == "reload") {
-        g_stringPool.Clear();
         g_translationDB.Reload();
         Log("[*] Reloaded!\n");
     }
@@ -2198,15 +2208,19 @@ static Fn_DialogBoxParamA g_origDialogBoxParamA = nullptr;
 
 // Callback to translate each child control in dialog
 static BOOL CALLBACK TranslateDialogChildProc(HWND hwnd, LPARAM lParam) {
-    char text[256];
-    if (GetWindowTextA(hwnd, text, sizeof(text)) > 0 && text[0]) {
+    wchar_t wideText[256];
+    if (GetWindowTextW(hwnd, wideText, 256) > 0 && wideText[0]) {
+        // Convert Unicode to SJIS for lookup (dialog resources are SJIS-encoded)
+        char sjisText[256];
+        WideCharToMultiByte(932, 0, wideText, -1, sjisText, sizeof(sjisText), nullptr, nullptr);
+        
         // Try to find translation
-        const std::string* translation = g_translationDB.FindUITranslation(text);
+        const std::string* translation = g_translationDB.FindUITranslation(sjisText);
         if (translation) {
             // Convert UTF-8 translation to Unicode and set
-            wchar_t wideText[256];
-            MultiByteToWideChar(CP_UTF8, 0, translation->c_str(), -1, wideText, 256);
-            SetWindowTextW(hwnd, wideText);
+            wchar_t translatedText[256];
+            MultiByteToWideChar(CP_UTF8, 0, translation->c_str(), -1, translatedText, 256);
+            SetWindowTextW(hwnd, translatedText);
         }
     }
     return TRUE; // Continue enumeration
@@ -2216,22 +2230,43 @@ static INT_PTR WINAPI DialogBoxParamA_Hook(
     HINSTANCE hInstance, LPCSTR lpTemplateName, HWND hWndParent,
     DLGPROC lpDialogFunc, LPARAM dwInitParam)
 {
-    // Install a temporary CBT hook to translate dialog when it activates
+    // Install a temporary CBT hook to translate dialog
     static HHOOK s_cbtHook = nullptr;
+    static std::string s_pendingTitle; // Store translated title for later
     
     auto cbtProc = [](int nCode, WPARAM wParam, LPARAM lParam) -> LRESULT {
-        if (nCode == HCBT_ACTIVATE) {
+        if (nCode == HCBT_CREATEWND) {
+            // Window is being created - we can access CREATESTRUCT
+            // Only capture the FIRST window (the dialog itself), not child controls
+            if (s_pendingTitle.empty()) {
+                CBT_CREATEWND* pCreate = (CBT_CREATEWND*)lParam;
+                if (pCreate && pCreate->lpcs && pCreate->lpcs->lpszName) {
+                    // lpszName is actually Unicode (wchar_t*) even for ANSI API calls
+                    const wchar_t* wideName = (const wchar_t*)pCreate->lpcs->lpszName;
+                    
+                    // Only process if it looks like a string (not a resource ID)
+                    if ((uintptr_t)wideName > 0xFFFF && wideName[0]) {
+                        // Convert Unicode to SJIS for lookup
+                        char sjisName[256];
+                        WideCharToMultiByte(932, 0, wideName, -1, sjisName, sizeof(sjisName), nullptr, nullptr);
+                        
+                        const std::string* translation = g_translationDB.FindUITranslation(sjisName);
+                        if (translation) {
+                            s_pendingTitle = *translation;
+                        }
+                    }
+                }
+            }
+        }
+        else if (nCode == HCBT_ACTIVATE) {
             HWND hwnd = (HWND)wParam;
             
-            // Translate dialog title
-            char title[256];
-            if (GetWindowTextA(hwnd, title, sizeof(title)) > 0 && title[0]) {
-                const std::string* translation = g_translationDB.FindUITranslation(title);
-                if (translation) {
-                    wchar_t wideTitle[256];
-                    MultiByteToWideChar(CP_UTF8, 0, translation->c_str(), -1, wideTitle, 256);
-                    SetWindowTextW(hwnd, wideTitle);
-                }
+            // Apply pending title translation if we found one
+            if (!s_pendingTitle.empty()) {
+                wchar_t wideTitle[256];
+                MultiByteToWideChar(CP_UTF8, 0, s_pendingTitle.c_str(), -1, wideTitle, 256);
+                SetWindowTextW(hwnd, wideTitle);
+                s_pendingTitle.clear();
             }
             
             // Translate all child controls
@@ -2240,6 +2275,7 @@ static INT_PTR WINAPI DialogBoxParamA_Hook(
         return CallNextHookEx(s_cbtHook, nCode, wParam, lParam);
     };
     
+    s_pendingTitle.clear();
     s_cbtHook = SetWindowsHookExW(WH_CBT, cbtProc, nullptr, GetCurrentThreadId());
     
     INT_PTR result = g_origDialogBoxParamA(hInstance, lpTemplateName, hWndParent, lpDialogFunc, dwInitParam);
@@ -2358,40 +2394,34 @@ static bool Initialize() {
     // Hook GetACP/GetOEMCP
     if (MH_CreateHookApi(L"kernel32", "GetACP",
         (void*)&GetACP_Hook, (void**)&g_origGetACP) == MH_OK) {
-        MH_EnableHook(MH_ALL_HOOKS);
         Log("[LOCALE] GetACP hooked -> 932 (Japanese)\n");
     }
 
     if (MH_CreateHookApi(L"kernel32", "GetOEMCP",
         (void*)&GetOEMCP_Hook, (void**)&g_origGetOEMCP) == MH_OK) {
-        MH_EnableHook(MH_ALL_HOOKS);
         Log("[LOCALE] GetOEMCP hooked -> 932 (Japanese)\n");
     }
 
     // Hook CharPrevA/CharNextA
     if (MH_CreateHookApi(L"user32", "CharPrevA",
         (void*)&CharPrevA_Hook, (void**)&g_origCharPrevA) == MH_OK) {
-        MH_EnableHook(MH_ALL_HOOKS);
         Log("[LOCALE] CharPrevA hooked -> SJIS\n");
     }
 
     if (MH_CreateHookApi(L"user32", "CharNextA",
         (void*)&CharNextA_Hook, (void**)&g_origCharNextA) == MH_OK) {
-        MH_EnableHook(MH_ALL_HOOKS);
         Log("[LOCALE] CharNextA hooked -> SJIS\n");
     }
 
     // Hook OutputDebugStringA to capture game debug output
     if (MH_CreateHookApi(L"kernel32", "OutputDebugStringA",
         (void*)&OutputDebugStringA_Hook, (void**)&g_origOutputDebugStringA) == MH_OK) {
-        MH_EnableHook(MH_ALL_HOOKS);
-        Log("[+] OutputDebugStringA hooked - game debug → console\n");
+        Log("[+] OutputDebugStringA hooked - game debug -> console\n");
     }
 
     // Hook GetGlyphOutlineA
     if (MH_CreateHookApi(L"gdi32", "GetGlyphOutlineA",
         (void*)&GetGlyphOutlineA_Hook, (void**)&g_origGetGlyphOutlineA) == MH_OK) {
-        MH_EnableHook(MH_ALL_HOOKS);
         Log("[+] GetGlyphOutlineA hooked\n");
     }
 
@@ -2399,7 +2429,6 @@ static bool Initialize() {
     if (MH_CreateHookApi(L"gdi32", "CreateFontIndirectA",
         (void*)&CreateFontIndirectA_Hook,
         (void**)&g_origCreateFontIndirectA) == MH_OK) {
-        MH_EnableHook(MH_ALL_HOOKS);
         Log("[+] Font hook installed\n");
     }
 
@@ -2411,10 +2440,12 @@ static bool Initialize() {
 
         if (MH_CreateHookApi(L"kernel32", "CreateFileA",
             (void*)&CreateFileA_Hook, (void**)&g_origCreateFileA) == MH_OK) {
-            MH_EnableHook(MH_ALL_HOOKS);
             Log("[+] Asset redirection hooked (%s)\n", Config::tlAssetsPath);
         }
     }
+
+    // Enable all API hooks at once
+    MH_EnableHook(MH_ALL_HOOKS);
 
     // Start file watcher
     std::string watchDir = ".\\tl"; // Default
@@ -2428,7 +2459,6 @@ static bool Initialize() {
         AssetRedirect::GetFileName(Config::translationFile), 
         AssetRedirect::GetFileName(Config::namesFile) 
     }, []() {
-        g_stringPool.Clear();
         g_translationDB.Reload();
         MessageBeep(MB_OK);
     });
@@ -2580,12 +2610,10 @@ static BOOL WINAPI SetWindowTextA_Hook(HWND hWnd, LPCSTR lpString)
     }
 
     if (lpString) {
-        // Convert SJIS → Unicode
         int wlen = g_origMultiByteToWideChar(932, 0, lpString, -1, nullptr, 0);
-        if (wlen > 0) {
-            wchar_t* wstr = (wchar_t*)_alloca(wlen * sizeof(wchar_t));
+        if (wlen > 0 && wlen <= 4096) {
+            wchar_t wstr[4096];
             g_origMultiByteToWideChar(932, 0, lpString, -1, wstr, wlen);
-            // Use DefWindowProcW to bypass ANSI WndProc
             DefWindowProcW(hWnd, WM_SETTEXT, 0, (LPARAM)wstr);
             return TRUE;
         }
@@ -2596,13 +2624,17 @@ static BOOL WINAPI SetWindowTextA_Hook(HWND hWnd, LPCSTR lpString)
 //=============================================================================
 // winmm.dll Proxy Entry Point
 //=============================================================================
+static DWORD WINAPI DeferredInit(LPVOID) {
+    Initialize();
+    return 0;
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
     switch (reason) {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
-
         proxy_init();
-        Initialize();
+        CreateThread(nullptr, 0, DeferredInit, nullptr, 0, nullptr);
         break;
 
     case DLL_PROCESS_DETACH:
