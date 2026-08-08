@@ -1,7 +1,5 @@
-﻿#define WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
-#include <objbase.h>
-#include <Psapi.h>
 #include <cstdio>
 #include <cstdint>
 #include <string>
@@ -12,6 +10,7 @@
 #include <fstream>
 #include <mutex>
 #include <vector>
+#include <algorithm>
 #include <functional>
 #include <atomic>
 #include <chrono> 
@@ -19,22 +18,79 @@
 #include <discord_rpc.h>
 #include "proxy.h"
 
-#pragma comment(lib, "psapi.lib")
-
 //=============================================================================
 // Function Offsets (ImageBase 0x10000000)
 //=============================================================================
 namespace Offsets {
-    constexpr uintptr_t AdvCharSay    = 0x00039A10; // RetouchAdvCharacter::say()
-    constexpr uintptr_t PrintEx       = 0x00049A50; // RetouchPrintManager::printEx()
-    constexpr uintptr_t SaveDataTitle = 0x0004D470; // RetouchSaveDataControl::title()
+    constexpr uintptr_t AdvCharSay       = 0x00039A10; // RetouchAdvCharacter::say()
+    constexpr uintptr_t PrintSub         = 0x000499D0; // RetouchPrintManager::printSub()
+    constexpr uintptr_t PrintEx          = 0x00049A50; // RetouchPrintManager::printEx()
+    constexpr uintptr_t DrawHistory      = 0x0004B380; // RetouchPrintManager::drawHistory()
+    constexpr uintptr_t SaveDataTitle    = 0x0004D470; // RetouchSaveDataControl::title()
     constexpr uintptr_t SaveDataIsValid  = 0x0004C210; // RetouchSaveDataControl::isValid()
     constexpr uintptr_t SaveDataGetItem  = 0x0004C2E0; // RetouchSaveDataControl::getItem()
     constexpr uintptr_t PrepareQuestion  = 0x000A5A20; // RetouchSystem::prepareQuestion()
     constexpr uintptr_t CalcIniValue     = 0x000ACCD0; // RetouchSystem::calcIniValue()
     constexpr uintptr_t LiteSetDebugMode = 0x000B20D0; // RetouchSystem::liteSetDebugMode()
     constexpr uintptr_t LiteLoad         = 0x000C11D0; // RetouchSystem::liteLoad()
-    constexpr uintptr_t GetCodePage      = 0x00137030;
+    constexpr uintptr_t CmdMessage       = 0x000CF370; // RetouchSystem::cmdMessage()
+}
+
+//=============================================================================
+// Print Context Layout (resident.dll)
+//=============================================================================
+// Geometry and font of the message box, reached from printEx's "this":
+//
+//   ctx = *(void**)(*(void**)(printMgr + Target) + FCStringData)
+//
+//   newline target : x = RectLeft + Indent,  y = PenY + LineHeight
+//   usable width   : RectRight - (RectLeft + Indent)
+//   pen advance    : x += GLYPHMETRICS.gmCellIncX, per character
+//
+// Porting to another ExHIBIT title means re-deriving this table; the rest of
+// WordWrap is engine-independent.
+namespace PrintMgrOffsets {
+    constexpr size_t Target       = 0x38;  // -> FCString-like holder
+    constexpr size_t FCStringData = 0x14;  // holder -> print context
+}
+
+namespace PrintCtxOffsets {
+    constexpr size_t Flags      = 0x004;   // bit 2 set = vertical writing
+    constexpr size_t RectLeft   = 0x150;   // FCRect: text box, screen pixels
+    constexpr size_t RectTop    = 0x154;
+    constexpr size_t RectRight  = 0x158;
+    constexpr size_t RectBottom = 0x15C;
+    constexpr size_t PenX       = 0x164;   // caret, screen pixels
+    constexpr size_t PenY       = 0x168;
+    constexpr size_t LineHeight = 0x178;   // added to PenY on newline
+    constexpr size_t Indent     = 0x17C;   // added to RectLeft on newline
+    constexpr size_t LogFont    = 0x1A4;   // LOGFONTA; this context's font
+    constexpr size_t FontHandle = 0x1E0;   // HFONT built from LogFont
+    constexpr size_t AntiAlias  = 0x23D;   // byte; selects the GGO_* format
+}
+
+//=============================================================================
+// Shift-JIS Character Classes (kinsoku)
+//=============================================================================
+//   0x8141-0x8149  、。，．・：；？！
+//   0x815B         ー
+//   0x8165-0x8176  bracket pairs; odd trail opens, even trail closes
+namespace Sjis {
+    constexpr unsigned char PunctLead     = 0x81;
+    constexpr unsigned char PunctFirst    = 0x41;  // 、
+    constexpr unsigned char PunctLast     = 0x49;  // ！
+    constexpr unsigned char ProlongedMark = 0x5B;  // ー
+    constexpr unsigned char BracketFirst  = 0x65;
+    constexpr unsigned char BracketLast   = 0x76;
+
+    // Small kana, which may not begin a line
+    constexpr unsigned short kSmallKana[] = {
+        0x829F, 0x82A1, 0x82A3, 0x82A5, 0x82A7,          // ぁぃぅぇぉ
+        0x82C1, 0x82E1, 0x82E3, 0x82E5, 0x82EC,          // っゃゅょゎ
+        0x8340, 0x8342, 0x8344, 0x8346, 0x8348,          // ァィゥェォ
+        0x8362, 0x8383, 0x8385, 0x8387, 0x838E,          // ッャュョヮ
+        0x8395, 0x8396,                                  // ヵヶ
+    };
 }
 
 //=============================================================================
@@ -52,14 +108,18 @@ namespace Constants {
 // Configuration
 //=============================================================================
 namespace Config {
-    // Default file paths (relative to game executable)
+    // Default file paths
     constexpr const char* kDefaultTranslationFile = ".\\tl\\translation.tsv";
     constexpr const char* kDefaultNamesFile = ".\\tl\\unique_names.tsv";
     constexpr const char* kDefaultCharIdFile = ".\\tl\\char_table.tsv";
     constexpr const char* kDefaultTlAssetsPath = ".\\tl\\assets\\";
+    constexpr const char* kDefaultScriptsDir = ".\\tl\\scripts";
+    constexpr const char* kDefaultUiFile = ".\\tl\\ui.tsv";
 
-    // Runtime file paths (configurable via INI)
+    // Runtime file paths
     char translationFile[MAX_PATH] = ".\\tl\\translation.tsv";
+    char scriptsDir[MAX_PATH] = ".\\tl\\scripts";
+    char uiFile[MAX_PATH] = ".\\tl\\ui.tsv";
     char namesFile[MAX_PATH] = ".\\tl\\unique_names.tsv";
     char charIdFile[MAX_PATH] = ".\\tl\\char_table.tsv";
     char configFile[MAX_PATH] = ".\\yotsuiro_tl.ini";
@@ -69,11 +129,17 @@ namespace Config {
     char windowTitle[256] = "";
     bool enableConsole = true;
     bool enableTextLogging = true;
+    char logFile[MAX_PATH] = ".\\tl\\hook.log";   // empty = disable
     bool dumpUntranslated = false;
     bool enableDiscordPresence = true;
 
     // Text
-    int wordWrapWidth = 70;
+    enum class WrapMode { Off, Chars, Pixel };
+
+    WrapMode wrapMode = WrapMode::Pixel;
+    int wrapSafetyPx = 12;
+    int wordWrapWidth = 70;   // chars mode, and pixel-mode fallback
+    bool warnOnOverflow = true;
 
     // Hotkeys
     int reloadHotkey = VK_F5;
@@ -83,6 +149,8 @@ namespace Config {
     // Font
     char fontName[64] = "";
     char fontNameProportional[64] = "";
+    // Used for Japanese glyphs when the custom face has no Shift-JIS charset
+    char fontFallbackJp[64] = "";
 
     // Asset redirection
     bool enableAssetRedirect = true;
@@ -110,10 +178,13 @@ static void SaveDefaultConfig() {
     fprintf(f, "WindowTitle=\n");
     fprintf(f, "\n");
     fprintf(f, "; Show debug console window\n");
-    fprintf(f, "EnableConsole=true\n");
+    fprintf(f, "EnableConsole=false\n");
     fprintf(f, "\n");
     fprintf(f, "; Log text to console\n");
     fprintf(f, "EnableTextLogging=true\n");
+    fprintf(f, "\n");
+    fprintf(f, "; Write log to file (empty=disable)\n");
+    fprintf(f, "LogFile=.\\tl\\hook.log\n");
     fprintf(f, "\n");
     fprintf(f, "; Dump untranslated text to file\n");
     fprintf(f, "DumpUntranslated=false\n");
@@ -123,8 +194,20 @@ static void SaveDefaultConfig() {
     fprintf(f, "\n");
 
     fprintf(f, "[Text]\n");
-    fprintf(f, "; Word wrap width (characters per line, 0=disable)\n");
+    fprintf(f, "; Wrap mode:\n");
+    fprintf(f, ";   pixel = fit to the in-game text box, using the game's font\n");
+    fprintf(f, ";   chars = fixed character count, see WordWrapWidth\n");
+    fprintf(f, ";   off   = don't wrap\n");
+    fprintf(f, "WrapMode=pixel\n");
+    fprintf(f, "\n");
+    fprintf(f, "; Pixels kept clear of the box edge (raise if words still split)\n");
+    fprintf(f, "WrapSafetyPx=12\n");
+    fprintf(f, "\n");
+    fprintf(f, "; Word wrap width (characters per line, 0=disable) - chars mode only\n");
     fprintf(f, "WordWrapWidth=70\n");
+    fprintf(f, "\n");
+    fprintf(f, "; Warn when a line needs more lines than the box can show\n");
+    fprintf(f, "WarnOnOverflow=true\n");
     fprintf(f, "\n");
 
     fprintf(f, "[Hotkeys]\n");
@@ -141,12 +224,23 @@ static void SaveDefaultConfig() {
     fprintf(f, "; Proportional font (empty=same as Name)\n");
     fprintf(f, "NameProportional=\n");
     fprintf(f, "\n");
+    fprintf(f, "; Japanese glyphs when the font above is Latin-only\n");
+    fprintf(f, "; (untranslated lines, unmapped names). Empty=MS Gothic\n");
+    fprintf(f, "FallbackJapanese=\n");
+    fprintf(f, "\n");
 
     fprintf(f, "[Files]\n");
-    fprintf(f, "; Translation file paths (relative to game folder)\n");
+    fprintf(f, "; Translation file paths\n");
+    fprintf(f, "; Dev style; for experimenting\n");
     fprintf(f, "TranslationFile=.\\tl\\translation.tsv\n");
+    fprintf(f, "; Per-RLD split; used in preference to TranslationFile when present\n");
+    fprintf(f, "ScriptsDir=.\\tl\\scripts\n");
+    fprintf(f, "; Shared names\n");
     fprintf(f, "NamesFile=.\\tl\\unique_names.tsv\n");
+    fprintf(f, "; CharID -> original JP name (used when say() gets a NULL name pointer)\n");
     fprintf(f, "CharIdFile=.\\tl\\char_table.tsv\n");
+    fprintf(f, "; Engine UI strings from ExHIBIT.exe dialog resources + .rdata\n");
+    fprintf(f, "UiFile=.\\tl\\ui.tsv\n");
     fprintf(f, "\n");
 
     fprintf(f, "[Assets]\n");
@@ -201,7 +295,6 @@ static void Log(const char* fmt, ...);
 namespace DebugJump {
     static std::mutex g_mutex;
     static std::string g_pendingScene;
-    static int g_pendingBlockId = 0;
     static bool g_jumpRequested = false;
     static void* g_retouchSystem = nullptr;
     static bool g_debugModeActive = false;
@@ -218,11 +311,21 @@ static void LoadConfig() {
     ReadString("General", "WindowTitle", "", Config::windowTitle, sizeof(Config::windowTitle));
     Config::enableConsole = ReadBool("General", "EnableConsole", true);
     Config::enableTextLogging = ReadBool("General", "EnableTextLogging", true);
+    ReadString("General", "LogFile", ".\\tl\\hook.log", Config::logFile, sizeof(Config::logFile));
     Config::dumpUntranslated = ReadBool("General", "DumpUntranslated", false);
     Config::enableDiscordPresence = ReadBool("General", "EnableDiscordPresence", true);
 
     // Text
+    {
+        char mode[16];
+        ReadString("Text", "WrapMode", "pixel", mode, sizeof(mode));
+        if (_stricmp(mode, "off") == 0)        Config::wrapMode = Config::WrapMode::Off;
+        else if (_stricmp(mode, "chars") == 0) Config::wrapMode = Config::WrapMode::Chars;
+        else                                   Config::wrapMode = Config::WrapMode::Pixel;
+    }
+    Config::wrapSafetyPx = ReadInt("Text", "WrapSafetyPx", 12);
     Config::wordWrapWidth = ReadInt("Text", "WordWrapWidth", 70);
+    Config::warnOnOverflow = ReadBool("Text", "WarnOnOverflow", true);
 
     // Hotkeys
     Config::reloadHotkey = ReadInt("Hotkeys", "ReloadKey", VK_F5);
@@ -232,10 +335,13 @@ static void LoadConfig() {
     // Font
     ReadString("Font", "Name", "", Config::fontName, sizeof(Config::fontName));
     ReadString("Font", "NameProportional", "", Config::fontNameProportional, sizeof(Config::fontNameProportional));
+    ReadString("Font", "FallbackJapanese", "", Config::fontFallbackJp, sizeof(Config::fontFallbackJp));
 
     // Files
     ReadString("Files", "TranslationFile", Config::kDefaultTranslationFile, Config::translationFile, sizeof(Config::translationFile));
+    ReadString("Files", "ScriptsDir", Config::kDefaultScriptsDir, Config::scriptsDir, sizeof(Config::scriptsDir));
     ReadString("Files", "NamesFile", Config::kDefaultNamesFile, Config::namesFile, sizeof(Config::namesFile));
+    ReadString("Files", "UiFile", Config::kDefaultUiFile, Config::uiFile, sizeof(Config::uiFile));
     ReadString("Files", "CharIdFile", Config::kDefaultCharIdFile, Config::charIdFile, sizeof(Config::charIdFile));
 
     // Asset Redirection
@@ -250,7 +356,7 @@ static void LoadConfig() {
     // Initialize debug state from config
     DebugJump::g_debugModeActive = Config::enableGameDebugOutput;
 
-    // Ensure path ends with backslash
+    // Ensure paths end with backslash
     size_t len = strlen(Config::tlAssetsPath);
     if (len > 0 && Config::tlAssetsPath[len - 1] != '\\') {
         strcat_s(Config::tlAssetsPath, "\\");
@@ -272,7 +378,6 @@ static HANDLE g_discordThread = nullptr;
 static std::mutex g_discordMutex;
 static bool g_presenceTimerSet = false;
 static std::string g_currentChapter = "Loading...";
-static std::chrono::steady_clock::time_point g_presenceStartTime;
 
 static const char* DISCORD_CLIENT_ID = "1466328361583251488";
 
@@ -329,7 +434,6 @@ static void InitDiscordRPC() {
     handlers.errored    = OnDiscordError;
 
     Discord_Initialize(DISCORD_CLIENT_ID, &handlers, 1, nullptr);
-    g_presenceStartTime = std::chrono::steady_clock::now();
     g_discordRunning = true;
 
     g_discordThread = CreateThread(nullptr, 0, DiscordUpdateThreadProc, nullptr, 0, nullptr);
@@ -373,9 +477,16 @@ void UpdateChapterPresence(const std::string& chapterName) {
 //=============================================================================
 static FILE* g_logFile = nullptr;
 static std::mutex g_logMutex;
+static std::string g_earlyLog;
+static bool g_earlyLogDone = false;
 
 static void InitConsole() {
-    if (!Config::enableConsole) return;
+    if (!Config::enableConsole) {
+        std::lock_guard<std::mutex> lock(g_logMutex);
+        g_earlyLog.clear();
+        g_earlyLogDone = true;
+        return;
+    }
     AllocConsole();
     std::wstring title = L"Translation Hook";
     if (Config::windowTitle[0]) {
@@ -392,17 +503,75 @@ static void InitConsole() {
     SetConsoleCP(CP_UTF8);
     freopen_s(&g_logFile, "CONOUT$", "w", stdout);
     setvbuf(stdout, nullptr, _IONBF, 0);
+
+    // Flush everything logged before the console existed
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    if (!g_earlyLog.empty()) {
+        fputs(g_earlyLog.c_str(), g_logFile);
+        fflush(g_logFile);
+        g_earlyLog.clear();
+    }
+    g_earlyLogDone = true;
+}
+
+// Disk log. The console is capped by its screen buffer and re-encodes Japanese,
+// so it loses the start of a session and mangles text.
+static FILE* g_diskLog = nullptr;
+
+static void InitDiskLog() {
+    if (!Config::logFile[0]) return;
+
+    CreateDirectoryA(".\\tl", nullptr);
+
+    FILE* f = nullptr;
+    if (fopen_s(&f, Config::logFile, "wb") != 0 || !f) return;
+
+    static const unsigned char kBom[] = { 0xEF, 0xBB, 0xBF };
+    fwrite(kBom, 1, sizeof(kBom), f);   // so editors read it as UTF-8
+
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    g_diskLog = f;
+    if (!g_earlyLog.empty()) {          // replay anything logged before this
+        fputs(g_earlyLog.c_str(), g_diskLog);
+        fflush(g_diskLog);
+    }
 }
 
 static void Log(const char* fmt, ...) {
-    if (!g_logFile) return;
-    std::lock_guard<std::mutex> lock(g_logMutex);
+    char stackBuf[2048];
+    std::string heapBuf;
+    const char* text = stackBuf;
+
     va_list args;
     va_start(args, fmt);
-    vfprintf(g_logFile, fmt, args);
+    int n = vsnprintf(stackBuf, sizeof(stackBuf), fmt, args);
     va_end(args);
-    fflush(g_logFile);
+    if (n < 0) return;
+
+    if ((size_t)n >= sizeof(stackBuf)) {
+        heapBuf.resize((size_t)n + 1);
+        va_start(args, fmt);
+        vsnprintf(&heapBuf[0], heapBuf.size(), fmt, args);
+        va_end(args);
+        heapBuf.resize((size_t)n);
+        text = heapBuf.c_str();
+    }
+
+    std::lock_guard<std::mutex> lock(g_logMutex);
+
+    if (g_logFile) {
+        fputs(text, g_logFile);
+        fflush(g_logFile);
+    } else if (!g_earlyLogDone) {
+        g_earlyLog.append(text);
+    }
+
+    if (g_diskLog) {
+        fputs(text, g_diskLog);
+        fflush(g_diskLog);
+    }
 }
+
 
 //=============================================================================
 // Encoding Detection & Conversion
@@ -511,6 +680,44 @@ namespace Encoding {
         return sjis;
     }
 
+    // As Utf8ToSjis, but reports what CP932 could not carry. Those are best-fit
+    // away silently and the call still reports success, so `lost` maps byte
+    // offsets in the returned string to the original character.
+    std::string Utf8ToSjisTracked(const char* utf8,
+                                  std::unordered_map<size_t, wchar_t>& lost) {
+        lost.clear();
+        if (!utf8 || !*utf8) return "";
+
+        int wideLen = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
+        if (wideLen <= 0) return "";
+
+        std::wstring wide(wideLen, 0);
+        MultiByteToWideChar(CP_UTF8, 0, utf8, -1, &wide[0], wideLen);
+        if (!wide.empty() && wide.back() == 0) wide.pop_back();
+
+        std::string sjis;
+        sjis.reserve(wide.size() * 2);
+
+        char buf[8];
+        for (size_t i = 0; i < wide.size(); i++) {
+            BOOL usedDefault = FALSE;
+            int n = WideCharToMultiByte(932, WC_NO_BEST_FIT_CHARS, &wide[i], 1,
+                                        buf, sizeof(buf), nullptr, &usedDefault);
+            if (n > 0 && !usedDefault) {
+                sjis.append(buf, n);        // CP932 carries it for real
+                continue;
+            }
+            // Not representable. Emit whatever best-fit produces (an unaccented
+            // letter, or '?') so the string stays valid Shift-JIS and a missing
+            // hook degrades to today's output rather than to garbage.
+            n = WideCharToMultiByte(932, 0, &wide[i], 1, buf, sizeof(buf), nullptr, nullptr);
+            if (n <= 0) { buf[0] = '?'; n = 1; }
+            lost[sjis.size()] = wide[i];
+            sjis.append(buf, n);
+        }
+        return sjis;
+    }
+
     // Convert any encoding to UTF-8
     std::string ToUtf8(const std::string& data, Type encoding) {
         switch (encoding) {
@@ -588,62 +795,6 @@ namespace AssetRedirect {
 }
 
 //=============================================================================
-// Shitty Text Fix
-//=============================================================================
-namespace TextFix {
-    // Replace UTF-8 chars that don't exist in SJIS with ones that do
-    std::string NormalizeUtf8(const std::string& utf8) {
-        std::string result;
-        result.reserve(utf8.size());
-
-        for (size_t i = 0; i < utf8.size(); ) {
-            // Check for em-dash "?" (UTF-8: E2 80 94)
-            if (i + 2 < utf8.size() &&
-                (unsigned char)utf8[i] == 0xE2 &&
-                (unsigned char)utf8[i+1] == 0x80 &&
-                (unsigned char)utf8[i+2] == 0x94) {
-                // Replace with horizontal bar "―" (UTF-8: E2 80 95) - exists in SJIS
-                result += "\xE2\x80\x95";
-                i += 3;
-                continue;
-            }
-
-            // Check for en-dash "?" (UTF-8: E2 80 93)
-            if (i + 2 < utf8.size() &&
-                (unsigned char)utf8[i] == 0xE2 &&
-                (unsigned char)utf8[i+1] == 0x80 &&
-                (unsigned char)utf8[i+2] == 0x93) {
-                result += "\xE2\x80\x95";
-                i += 3;
-                continue;
-            }
-
-            // Check for curly quotes and replace with straight
-            if (i + 2 < utf8.size() &&
-                (unsigned char)utf8[i] == 0xE2 &&
-                (unsigned char)utf8[i+1] == 0x80) {
-                unsigned char c3 = (unsigned char)utf8[i+2];
-                if (c3 == 0x98 || c3 == 0x99) {  // ' or '
-                    result += "'";
-                    i += 3;
-                    continue;
-                }
-                if (c3 == 0x9C || c3 == 0x9D) {  // " or "
-                    result += "\"";
-                    i += 3;
-                    continue;
-                }
-            }
-
-            result += utf8[i];
-            i++;
-        }
-
-        return result;
-    }
-}
-
-//=============================================================================
 // Translation Database
 //=============================================================================
 // Scene tracking globals
@@ -651,6 +802,23 @@ namespace {
     std::mutex g_sceneMutex;
     std::string g_currentFile;
     std::string g_currentLabel;
+
+    // Command index of the MESSAGE currently being dispatched.
+    // Captured by CmdMessage_Hook, consumed by AdvCharSay_Hook to key the lookup on
+    // (file, index) instead of on the message text.
+    //-1 when say() is reached from any path other than cmdMessage.
+    thread_local int t_cmdIndex = -1;
+
+    // Set while the backlog is being redrawn. drawHistory() runs from hitwait(),
+    // still inside cmdMessage, so t_cmdIndex is the live line's index and would
+    // key every backlog entry to it. Also keeps backlog scrolling out of scene
+    // tracking and the miss stats.
+    thread_local bool t_inHistory = false;
+
+    std::string CurrentSceneFile() {
+        std::lock_guard<std::mutex> lock(g_sceneMutex);
+        return g_currentFile;
+    }
 }
 
 class TranslationDB {
@@ -661,8 +829,14 @@ public:
         m_names.clear();
         m_contextualNames.clear();
         m_messages.clear();
+        m_uiStrings.clear();
         m_originalNamesByIndex.clear();
         m_labels.clear();
+        m_textByFileIndex.clear();
+        m_originalByFileIndex.clear();
+        m_messageToFile.clear();
+        m_messageToIndex.clear();
+        m_labelsByFileIndex.clear();
 
         int globalCount = 0;
         int contextualCount = 0;
@@ -670,82 +844,62 @@ public:
         int choiceCount = 0;
         int labelCount = 0;
 
-        // === STEP 1: Load global names from unique_names.tsv ===
+        // Load global names from unique_names.tsv
         if (namesPath) {
             globalCount = LoadGlobalNames(namesPath);
         }
 
-        // === STEP 2: Load translation.tsv (overrides global) ===
-        std::ifstream file(tsvPath, std::ios::binary | std::ios::ate);
-        if (!file) {
-            Log("[TL] Cannot open: %s\n", tsvPath);
-            return globalCount > 0;  // Still OK if we loaded names
-        }
-
-        size_t fileSize = (size_t)file.tellg();
-        file.seekg(0);
-
-        std::string content(fileSize, 0);
-        file.read(&content[0], fileSize);
-
-        Encoding::Type encoding = Encoding::Detect(content.c_str(), content.size());
-        std::string utf8Content = Encoding::ToUtf8(content, encoding);
-
-        // First pass: collect entries by index
+        // Load rows
+        // Prefer the per-RLD split otherwise fall back to the
+        // monolithic translation.tsv when that folder is absent or empty.
         std::map<std::pair<std::string, int>, std::string> namesByIndex;
         std::map<std::pair<std::string, int>, std::string> textsByIndex;
 
-        std::istringstream iss(utf8Content);
-        std::string line;
+        Encoding::Type encoding = Encoding::Type::Unknown;
+        int splitFiles = 0;
+        std::string sourceDesc;
 
-        while (std::getline(iss, line)) {
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line.empty() || line[0] == '#') continue;
+        std::vector<std::string> scriptFiles = ListTsvFiles(Config::scriptsDir);
+        for (const std::string& path : scriptFiles) {
+            std::string utf8;
+            Encoding::Type enc;
+            if (!ReadFileUtf8(path.c_str(), utf8, enc)) continue;
+            if (splitFiles == 0) encoding = enc;
 
-            std::vector<std::string> parts;
-            size_t start = 0, end;
-            while ((end = line.find('\t', start)) != std::string::npos) {
-                parts.push_back(line.substr(start, end - start));
-                start = end + 1;
-            }
-            parts.push_back(line.substr(start));
+            // FILE column is implicit: it is the filename stem.
+            std::string stem = path;
+            size_t slash = stem.find_last_of("\\/");
+            if (slash != std::string::npos) stem = stem.substr(slash + 1);
+            size_t dot = stem.find_last_of('.');
+            if (dot != std::string::npos) stem = stem.substr(0, dot);
 
-            if (parts.size() < 5 || parts[4].empty()) continue;
-
-            std::string fileId = parts[0];
-            int index = std::atoi(parts[1].c_str());
-            std::string type = parts[2];
-            std::string original = parts[3];
-            std::string translated = parts[4];
-
-            UnescapeString(original);
-            UnescapeString(translated);
-
-            auto key = std::make_pair(fileId, index);
-
-            if (type == "NAME") {
-                namesByIndex[key] = translated;
-                m_originalNamesByIndex[key] = original;
-            } else if (type == "TEXT" || type == "MSG") {
-                textsByIndex[key] = original;
-                m_messages[original] = translated;
-                m_messageToFile[original] = fileId;
-                m_messageToIndex[original] = index;
-                textCount++;
-            } else if (type == "LABEL") {
-                m_labels[original] = translated;
-                m_labelsByFileIndex[std::make_pair(fileId, index)] =
-                    translated.empty() ? original : translated;
-                labelCount++;
-            } else if (type.rfind("CHOICE_", 0) == 0) {
-                m_messages[original] = translated;
-                choiceCount++;
-            }
+            ParseTsvContent(utf8, stem, namesByIndex, textsByIndex,
+                            textCount, choiceCount, labelCount);
+            splitFiles++;
         }
 
-        // Second pass: build contextual names (these OVERRIDE global)
+        if (splitFiles > 0) {
+            sourceDesc = std::string(Config::scriptsDir) + " (" +
+                         std::to_string(splitFiles) + " files)";
+        } else {
+            std::string utf8;
+            if (!ReadFileUtf8(tsvPath, utf8, encoding)) {
+                Log("[TL] Cannot open: %s\n", tsvPath);
+                return globalCount > 0;  // Still OK if we loaded names
+            }
+            ParseTsvContent(utf8, std::string(), namesByIndex, textsByIndex,
+                            textCount, choiceCount, labelCount);
+            sourceDesc = tsvPath;
+        }
+
+        // load ui strings
+        int uiCount = LoadUiStrings(Config::uiFile);
+
         for (const auto& [key, translatedName] : namesByIndex) {
+            if (translatedName.empty()) continue;
+
             std::string originalName = m_originalNamesByIndex[key];
+            if (originalName.empty()) continue;
 
             auto textIt = textsByIndex.find(key);
             if (textIt != textsByIndex.end()) {
@@ -768,12 +922,13 @@ public:
             default: break;
         }
 
-        Log("[TL] Loaded (%s):\n", encodingName);
+        Log("[TL] Loaded (%s) from %s:\n", encodingName, sourceDesc.c_str());
         Log("[TL]   %d global names (from %s)\n", globalCount, namesPath ? namesPath : "none");
-        Log("[TL]   %d contextual names (from %s)\n", contextualCount, tsvPath);
+        Log("[TL]   %d contextual names\n", contextualCount);
         Log("[TL]   %d texts\n", textCount);
         Log("[TL]   %d choices\n", choiceCount);
         Log("[TL]   %d labels\n", labelCount);
+        Log("[TL]   %d UI strings (from %s)\n", uiCount, Config::uiFile);
 
         return true;
     }
@@ -789,20 +944,26 @@ public:
         int found = 0;
         Log("\n[SEARCH] Looking for: %s\n", searchText.c_str());
 
-        for (const auto& [key, val] : m_messages) {
-            if (key.find(searchText) != std::string::npos ||
-                val.find(searchText) != std::string::npos) {
-                Log("  [%s] -> [%s]\n",
-                    key.substr(0, 40).c_str(),
-                    val.substr(0, 40).c_str());
-                found++;
-                if (found >= Constants::kMaxSearchResults) {
-                    Log("  ... (showing first %d)\n", Constants::kMaxSearchResults);
-                    break;
+        auto searchMap = [&](const char* tag,
+                             const std::unordered_map<std::string, std::string>& m) {
+            for (const auto& [key, val] : m) {
+                if (found >= Constants::kMaxSearchResults) return;
+                if (key.find(searchText) != std::string::npos ||
+                    val.find(searchText) != std::string::npos) {
+                    Log("  %s [%s] -> [%s]\n", tag,
+                        key.substr(0, 40).c_str(),
+                        val.substr(0, 40).c_str());
+                    found++;
                 }
             }
-        }
+        };
 
+        searchMap("msg", m_messages);
+        searchMap("ui ", m_uiStrings);
+
+        if (found >= Constants::kMaxSearchResults) {
+            Log("  ... (showing first %d)\n", Constants::kMaxSearchResults);
+        }
         if (found == 0) {
             Log("  No matches found.\n");
         }
@@ -810,85 +971,123 @@ public:
     }
 
     // Context-aware name lookup
-    const std::string* FindNameTranslation(const char* sjisName, const char* sjisMessage) {
-        if (!sjisName || !*sjisName) return nullptr;
+    // NOTE: every Find* returns by VALUE. Returning a pointer into the maps is
+    // unsafe because Load() (hot reload, F5, or the file-watcher thread) calls
+    // clear() on them -- a caller still holding that pointer would dereference
+    // freed memory. An empty return means "no translation"; rows with an empty
+    // TRANSLATION column are dropped at load, so empty is never a valid hit.
+
+    std::string FindNameTranslation(const char* sjisName, const char* sjisMessage) {
+        if (!sjisName || !*sjisName) return std::string();
 
         std::string utf8Name = Encoding::SjisToUtf8(sjisName);
-        if (utf8Name.empty()) return nullptr;
+        if (utf8Name.empty()) return std::string();
 
-        std::lock_guard<std::mutex> lock(m_dataMutex);
+        {
+            std::lock_guard<std::mutex> lock(m_dataMutex);
 
-        // Try contextual lookup first (name + message)
-        if (sjisMessage && *sjisMessage) {
-            std::string utf8Msg = Encoding::SjisToUtf8(sjisMessage);
-            std::string contextKey = utf8Name + "|" + utf8Msg;
+            // Try contextual lookup first (name + message)
+            if (sjisMessage && *sjisMessage) {
+                std::string utf8Msg = Encoding::SjisToUtf8(sjisMessage);
+                std::string contextKey = utf8Name + "|" + utf8Msg;
 
-            auto it = m_contextualNames.find(contextKey);
-            if (it != m_contextualNames.end()) {
-                return &it->second;
+                auto it = m_contextualNames.find(contextKey);
+                if (it != m_contextualNames.end()) return it->second;
             }
-        }
 
-        // Fall back to global name lookup
-        auto it = m_names.find(utf8Name);
-        if (it != m_names.end()) {
-            return &it->second;
+            // Fall back to global name lookup
+            auto it = m_names.find(utf8Name);
+            if (it != m_names.end()) return it->second;
         }
 
         LogMissing(utf8Name.c_str(), "NAME");
-        return nullptr;
+        return std::string();
     }
 
-    const std::string* FindMessageTranslation(const char* sjisMessage) {
-        if (!sjisMessage || !*sjisMessage) return nullptr;
+    // `file`/`index` locate the exact MESSAGE command being executed. When they
+    // resolve, the translation is unique to that occurrence; otherwise we fall
+    // back to matching the whole text, which collapses duplicate lines.
+    std::string FindMessageTranslation(const char* sjisMessage,
+                                       const std::string& file = std::string(),
+                                       int index = -1) {
+        if (!sjisMessage || !*sjisMessage) return std::string();
 
         std::string utf8Key = Encoding::SjisToUtf8(sjisMessage);
-        if (utf8Key.empty()) return nullptr;
+        if (utf8Key.empty()) return std::string();
 
-        const std::string* result = nullptr;
+        std::string result;
+        bool found = false;
         std::string sceneFile, sceneLabel;
 
         {
             std::lock_guard<std::mutex> lock(m_dataMutex);
 
-            auto it = m_messages.find(utf8Key);
-            if (it != m_messages.end()) {
-                result = &it->second;
-                m_hitCount++;
-
-                auto fileIt = m_messageToFile.find(utf8Key);
-                auto indexIt = m_messageToIndex.find(utf8Key);
-                if (fileIt != m_messageToFile.end() && indexIt != m_messageToIndex.end()) {
-                    sceneFile = fileIt->second;
-                    sceneLabel = GetNearestLabel(sceneFile, indexIt->second);
+            // The index is only valid for the MESSAGE being dispatched, so check
+            // the ORIGINAL at (file, index) matches the text we were handed.
+            // Anything else inherits a stale t_cmdIndex and resolves to the
+            // wrong line -- the backlog redraw did exactly that.
+            if (!t_inHistory && !file.empty() && index >= 0) {
+                auto key = std::make_pair(file, index);
+                auto origIt = m_originalByFileIndex.find(key);
+                if (origIt != m_originalByFileIndex.end() && origIt->second == utf8Key) {
+                    auto posIt = m_textByFileIndex.find(key);
+                    if (posIt != m_textByFileIndex.end()) {
+                        result = posIt->second;
+                        found = true;
+                        sceneFile = file;
+                        sceneLabel = GetNearestLabel(file, index);
+                    }
                 }
             }
+
+            if (!found) {
+                auto it = m_messages.find(utf8Key);
+                if (it != m_messages.end()) {
+                    result = it->second;
+                    found = true;
+
+                    auto fileIt = m_messageToFile.find(utf8Key);
+                    auto indexIt = m_messageToIndex.find(utf8Key);
+                    if (fileIt != m_messageToFile.end() && indexIt != m_messageToIndex.end()) {
+                        sceneFile = fileIt->second;
+                        sceneLabel = GetNearestLabel(sceneFile, indexIt->second);
+                    }
+                }
+            }
+
+            if (found) m_hitCount++;
         }
 
-        if (result) {
+        if (found) {
             {
                 std::lock_guard<std::mutex> slock(m_statsMutex);
                 m_usedKeys.insert(utf8Key);
             }
 
-            if (!sceneFile.empty()) {
-                std::lock_guard<std::mutex> sceneLock(g_sceneMutex);
-                if (g_currentFile != sceneFile || g_currentLabel != sceneLabel) {
-                    g_currentFile = sceneFile;
-                    g_currentLabel = sceneLabel;
-                    if (!sceneLabel.empty()) {
-                        Log("[SCENE] %s | %s\n", g_currentFile.c_str(), g_currentLabel.c_str());
+            // Backlog scrolling is not story progress - don't move the scene.
+            if (!t_inHistory) {
+                if (!sceneFile.empty()) {
+                    std::lock_guard<std::mutex> sceneLock(g_sceneMutex);
+                    if (g_currentFile != sceneFile || g_currentLabel != sceneLabel) {
+                        g_currentFile = sceneFile;
+                        g_currentLabel = sceneLabel;
+                        if (!sceneLabel.empty()) {
+                            Log("[SCENE] %s | %s\n", g_currentFile.c_str(), g_currentLabel.c_str());
+                        }
                     }
                 }
-            }
 
-            std::string display = sceneLabel;
-            size_t bracket = display.rfind(" [");
-            if (bracket != std::string::npos) display.erase(bracket);
-            UpdateChapterPresence(display);
+                std::string display = sceneLabel;
+                size_t bracket = display.rfind(" [");
+                if (bracket != std::string::npos) display.erase(bracket);
+                UpdateChapterPresence(display);
+            }
 
             return result;
         }
+
+        // Backlog entries are stored post-translation, so they always miss.
+        if (t_inHistory) return std::string();
 
         m_missCount++;
         {
@@ -897,48 +1096,46 @@ public:
         }
 
         LogMissing(utf8Key.c_str(), "TEXT");
-        return nullptr;
+        return std::string();
     }
 
-    // Simple lookup for UI elements (dialogs, buttons) - no logging or tracking
-    const std::string* FindUITranslation(const char* sjisText) {
-        if (!sjisText || !*sjisText) return nullptr;
+    // UI
+    std::string FindUITranslation(const char* sjisText) {
+        if (!sjisText || !*sjisText) return std::string();
 
         std::string utf8Key = Encoding::SjisToUtf8(sjisText);
-        if (utf8Key.empty()) return nullptr;
+        if (utf8Key.empty()) return std::string();
 
         std::lock_guard<std::mutex> lock(m_dataMutex);
-        auto it = m_messages.find(utf8Key);
-        return (it != m_messages.end()) ? &it->second : nullptr;
+        auto it = m_uiStrings.find(utf8Key);
+        return (it != m_uiStrings.end()) ? it->second : std::string();
     }
 
     // Label
-    const std::string* FindLabelTranslation(const char* sjisLabel) {
-        if (!sjisLabel || !*sjisLabel) return nullptr;
+    std::string FindLabelTranslation(const char* sjisLabel) {
+        if (!sjisLabel || !*sjisLabel) return std::string();
 
         std::string utf8Key = Encoding::SjisToUtf8(sjisLabel);
-        if (utf8Key.empty()) return nullptr;
+        if (utf8Key.empty()) return std::string();
 
-        std::lock_guard<std::mutex> lock(m_dataMutex);
+        {
+            std::lock_guard<std::mutex> lock(m_dataMutex);
 
-        // Try exact match first
-        auto it = m_labels.find(utf8Key);
-        if (it != m_labels.end()) {
-            return &it->second;
-        }
+            // Try exact match first
+            auto it = m_labels.find(utf8Key);
+            if (it != m_labels.end()) return it->second;
 
-        // Save files don't include [X] suffix, but TSV does
-        // Try appending " [1]", " [2]", etc.
-        for (int i = 1; i <= Constants::kMaxLabelSuffixSearch; i++) {
-            std::string withSuffix = utf8Key + " [" + std::to_string(i) + "]";
-            it = m_labels.find(withSuffix);
-            if (it != m_labels.end()) {
-                return &it->second;
+            // Save files don't include [X] suffix, but TSV does
+            // Try appending " [1]", " [2]", etc.
+            for (int i = 1; i <= Constants::kMaxLabelSuffixSearch; i++) {
+                std::string withSuffix = utf8Key + " [" + std::to_string(i) + "]";
+                it = m_labels.find(withSuffix);
+                if (it != m_labels.end()) return it->second;
             }
         }
 
         LogMissing(utf8Key.c_str(), "LABEL");
-        return nullptr;
+        return std::string();
     }
 
     std::string GetNearestLabel(const std::string& file, int index) {
@@ -962,8 +1159,9 @@ public:
         std::lock_guard<std::mutex> slock(m_statsMutex);
 
         Log("\n========== Translation Stats ==========\n");
-        Log("  Loaded: %d messages, %d labels, %d names\n",
-            (int)m_messages.size(), (int)m_labels.size(), (int)m_names.size());
+        Log("  Loaded: %d messages, %d labels, %d names, %d ui\n",
+            (int)m_messages.size(), (int)m_labels.size(), (int)m_names.size(),
+            (int)m_uiStrings.size());
         Log("  Hits: %d | Misses: %d\n", m_hitCount.load(), m_missCount.load());
         Log("  Unique texts matched: %d\n", (int)m_usedKeys.size());
 
@@ -1019,6 +1217,45 @@ private:
             }
             file << "RUNTIME\t0\t" << type << "\t" << escaped << "\t\r\n";
         }
+    }
+
+    int LoadUiStrings(const char* uiPath) {
+        if (!uiPath || !*uiPath) return 0;
+
+        std::string utf8;
+        Encoding::Type encoding;
+        if (!ReadFileUtf8(uiPath, utf8, encoding)) return 0;
+
+        int count = 0;
+        std::istringstream iss(utf8);
+        std::string line;
+
+        while (std::getline(iss, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty() || line[0] == '#') continue;
+            if (line.rfind("ORIGINAL", 0) == 0) continue;
+
+            size_t tab = line.find('\t');
+            if (tab == std::string::npos) continue;
+
+            std::string original = line.substr(0, tab);
+            std::string translated = line.substr(tab + 1);
+            size_t tab2 = translated.find('\t');
+            if (tab2 != std::string::npos) translated = translated.substr(0, tab2);
+
+            while (!translated.empty() &&
+                   (translated.back() == ' ' || translated.back() == '\t')) {
+                translated.pop_back();
+            }
+            if (original.empty() || translated.empty()) continue;
+
+            UnescapeString(original);
+            UnescapeString(translated);
+
+            m_uiStrings[original] = translated;
+            count++;
+        }
+        return count;
     }
 
     int LoadGlobalNames(const char* namesPath) {
@@ -1079,11 +1316,143 @@ private:
         return count;
     }
 
+    // Read a file and convert it to UTF-8, auto-detecting the encoding.
+    static bool ReadFileUtf8(const char* path, std::string& utf8Out, Encoding::Type& encOut) {
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (!file) return false;
+
+        std::streamoff size = file.tellg();
+        if (size < 0) return false;
+        file.seekg(0);
+
+        std::string content((size_t)size, 0);
+        if (size > 0) file.read(&content[0], size);
+
+        encOut = Encoding::Detect(content.c_str(), content.size());
+        utf8Out = Encoding::ToUtf8(content, encOut);
+        return true;
+    }
+
+    // List *.tsv in a directory, sorted. Empty vector if the folder is absent.
+    static std::vector<std::string> ListTsvFiles(const char* dir) {
+        std::vector<std::string> out;
+        if (!dir || !*dir) return out;
+
+        std::string pattern = std::string(dir) + "\\*.tsv";
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return out;
+
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            out.push_back(std::string(dir) + "\\" + fd.cFileName);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+
+        std::sort(out.begin(), out.end());
+        return out;
+    }
+
+    // Parse TSV rows into the lookup maps.
+    //   fixedFileId empty -> monolithic layout: FILE INDEX TYPE ORIGINAL TRANSLATION
+    //   fixedFileId set   -> per-RLD layout:         INDEX TYPE ORIGINAL TRANSLATION
+    void ParseTsvContent(const std::string& utf8Content,
+                         const std::string& fixedFileId,
+                         std::map<std::pair<std::string, int>, std::string>& namesByIndex,
+                         std::map<std::pair<std::string, int>, std::string>& textsByIndex,
+                         int& textCount, int& choiceCount, int& labelCount) {
+        const bool split = !fixedFileId.empty();
+        const size_t minCols = split ? 4u : 5u;
+        const size_t tlCol = split ? 3u : 4u;
+
+        std::istringstream iss(utf8Content);
+        std::string line;
+
+        while (std::getline(iss, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty() || line[0] == '#') continue;
+
+            std::vector<std::string> parts;
+            size_t start = 0, end;
+            while ((end = line.find('\t', start)) != std::string::npos) {
+                parts.push_back(line.substr(start, end - start));
+                start = end + 1;
+            }
+            parts.push_back(line.substr(start));
+
+            if (parts.size() < minCols || parts[tlCol].empty()) continue;
+
+            std::string fileId = split ? fixedFileId : parts[0];
+            const size_t base = split ? 0u : 1u;      // index of the INDEX column
+            if (parts[base] == "INDEX" || parts[base] == "FILE") continue;   // header
+
+            int index = std::atoi(parts[base].c_str());
+            std::string type = parts[base + 1];
+            std::string original = parts[base + 2];
+            std::string translated = parts[tlCol];
+
+            UnescapeString(original);
+            UnescapeString(translated);
+
+            auto key = std::make_pair(fileId, index);
+
+            // An empty TRANSLATION means "not translated yet" and must NEVER reach a lookup map.
+            const bool hasTl = !translated.empty();
+
+            if (type == "NAME") {
+                // namesByIndex/m_originalNamesByIndex are a paired lookup
+                // consumed later in Load(); both sides are needed even when
+                // untranslated, and that consumer checks for empty itself.
+                namesByIndex[key] = translated;
+                m_originalNamesByIndex[key] = original;
+            } else if (type == "TEXT" || type == "MSG") {
+                textsByIndex[key] = original;          // scene tracking, all rows
+                // Checked against the engine's text before a (file,index)
+                // translation is accepted - see FindMessageTranslation.
+                m_originalByFileIndex[key] = original;
+                if (hasTl) {
+                    m_textByFileIndex[key] = translated;   // exact, per-occurrence
+                    m_messages[original] = translated;     // fallback, text-keyed
+                }
+                // Scene/Discord tracking works off the original text, so these
+                // two are populated regardless of translation state.
+                m_messageToFile[original] = fileId;
+                m_messageToIndex[original] = index;
+                if (hasTl) textCount++;
+            } else if (type == "LABEL") {
+                if (hasTl) {
+                    m_labels[original] = translated;
+                    labelCount++;
+                }
+                // GetNearestLabel() is scene tracking, not display: it wants a
+                // human-readable name for logging and Discord even when the
+                // label has no translation, so fall back to the original.
+                m_labelsByFileIndex[key] = hasTl ? translated : original;
+            } else if (type.rfind("CHOICE_", 0) == 0) {
+                if (hasTl) {
+                    m_messages[original] = translated;
+                    choiceCount++;
+                }
+            } else if (type == "SAVEDESC") {
+                // AUTOSAVE(0x0C) string -> UxAdvSystem::autoSave -> saveEngine()
+                // save-slot title, surfaced by RetouchSaveDataControl::title()
+                // on the same path as a BLOCK label.
+                if (hasTl) {
+                    m_labels[original] = translated;
+                    labelCount++;
+                }
+            }
+        }
+    }
+
     // Storage
     std::unordered_map<std::string, std::string> m_contextualNames;  // "name|message" -> translated_name
     std::unordered_map<std::string, std::string> m_names;            // name -> translated (fallback)
     std::unordered_map<std::string, std::string> m_messages;         // message -> translated
+    std::unordered_map<std::string, std::string> m_uiStrings;        // ui.tsv only: engine UI -> translated
     std::unordered_map<std::string, std::string> m_labels;           // label -> translated
+    std::map<std::pair<std::string, int>, std::string> m_textByFileIndex;  // (file,index) -> translated
+    std::map<std::pair<std::string, int>, std::string> m_originalByFileIndex;  // (file,index) -> original
     std::unordered_map<std::string, std::string> m_messageToFile;    // message -> file
     std::unordered_map<std::string, int> m_messageToIndex;           // message -> index
     std::map<std::pair<std::string, int>, std::string> m_labelsByFileIndex;  // (file,index) -> label
@@ -1120,12 +1489,632 @@ static StringPool g_stringPool;
 //=============================================================================
 // Word Wrapping
 //=============================================================================
+typedef HFONT(WINAPI* Fn_CreateFontIndirectA)(const LOGFONTA*);
+static Fn_CreateFontIndirectA g_origCreateFontIndirectA = nullptr;
+
+//=============================================================================
+// Font capability probe
+//=============================================================================
+// Asking for a Latin-only face at SHIFTJIS_CHARSET doesn't fail - GDI drops the
+// face and returns MS PGothic. GetTextFace can't detect it either: it reports
+// Japanese faces under their localized names, so comparing names false-negatives.
+// EnumFontFamiliesExA is the reliable question - one entry per charset the face
+// really has, none at all if it isn't installed.
+namespace FontProbe {
+    struct Info {
+        bool installed = false;
+        bool sjis      = false;
+    };
+
+    static std::mutex g_mutex;
+    static std::unordered_map<std::string, Info> g_cache;
+
+    static int CALLBACK EnumCb(const LOGFONTA* lf, const TEXTMETRICA*,
+                               DWORD, LPARAM lp) {
+        Info* info = (Info*)lp;
+        info->installed = true;
+        if (lf && lf->lfCharSet == SHIFTJIS_CHARSET) info->sjis = true;
+        return 1;
+    }
+
+    static Info Query(const char* face) {
+        if (!face || !face[0]) return Info{};
+
+        std::string key(face);
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            auto it = g_cache.find(key);
+            if (it != g_cache.end()) return it->second;
+        }
+
+        Info info;
+        LOGFONTA lf = {};
+        lf.lfCharSet = DEFAULT_CHARSET;   // enumerate every charset of this face
+        strncpy_s(lf.lfFaceName, face, _TRUNCATE);
+
+        if (HDC hdc = CreateCompatibleDC(nullptr)) {
+            EnumFontFamiliesExA(hdc, &lf, (FONTENUMPROCA)EnumCb, (LPARAM)&info, 0);
+            DeleteDC(hdc);
+        }
+
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_cache[key] = info;
+        return info;
+    }
+
+    // Set once a charset has been relaxed to keep a face; JpFallback reads it.
+    static std::atomic<bool> g_relaxed{ false };
+
+    static void ReportOnce(const char* face, const Info& info) {
+        static std::mutex mutex;
+        static std::unordered_set<std::string> said;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!said.insert(face).second) return;
+        }
+
+        if (!info.installed) {
+            Log("[FONT] '%s' is not installed - GDI will substitute a default"
+                " face. Check the name in [Font] matches the installed family"
+                " exactly.\n", face);
+        } else if (!info.sjis) {
+            Log("[FONT] '%s' has no Shift-JIS charset; requesting it with"
+                " DEFAULT_CHARSET so the face is honored. Japanese glyphs fall"
+                " back to a Gothic face.\n", face);
+        }
+    }
+}
+
+static void ApplyFontSubstitution(LOGFONTA& lf) {
+    // Proportional variant is usually marked by a fullwidth 'Ｐ' (SJIS 0x82 0x6F).
+    // NOTE: misses faces that are proportional without the marker - メイリオ,
+    //       which this game asks for, is substituted with a fixed-pitch face.
+    bool isProportional = (strstr(lf.lfFaceName, "\x82\x6F") != nullptr);
+
+    const char* newFont;
+    bool custom = true;
+    if (isProportional) {
+        if (Config::fontNameProportional[0] != '\0')  newFont = Config::fontNameProportional;
+        else if (Config::fontName[0] != '\0')         newFont = Config::fontName;
+        else                                        { newFont = "MS PGothic"; custom = false; }
+    } else {
+        if (Config::fontName[0] != '\0')              newFont = Config::fontName;
+        else                                        { newFont = "MS Gothic";  custom = false; }
+    }
+
+    // lfFaceName is LF_FACESIZE; the Config buffers are twice that. Truncate
+    // rather than let strcpy_s trip the invalid-parameter handler on a long name.
+    strncpy_s(lf.lfFaceName, newFont, _TRUNCATE);
+
+    // Ask for the charset the face can actually satisfy. Forcing SHIFTJIS on a
+    // Latin-only face is what silently discards it.
+    FontProbe::Info info = FontProbe::Query(lf.lfFaceName);
+    lf.lfCharSet = info.sjis ? SHIFTJIS_CHARSET : DEFAULT_CHARSET;
+
+    if (custom) {
+        FontProbe::ReportOnce(lf.lfFaceName, info);
+        if (info.installed && !info.sjis)
+            FontProbe::g_relaxed.store(true, std::memory_order_relaxed);
+    }
+}
+
+// True while WordWrap measures a glyph of its own; see GlyphAdvance.
+static thread_local bool g_measuringGlyph = false;
+
+//=============================================================================
+// Character restoration
+//=============================================================================
+// Shift-JIS cannot carry em dashes or accented Latin; Utf8ToSjisTracked emits
+// letter and records what it dropped. Records are keyed by the SJIS text
+// itself, not by pointer: the same line is re-rendered from a different buffer
+// on backlog redraw, and names arrive from a different call site than messages.
+// PrintSub_Hook installs the matching record; the glyph hook reads it.
+namespace CharRestore {
+    typedef std::unordered_map<size_t, wchar_t> Map;
+
+    static std::mutex                        g_mutex;
+    static std::unordered_map<std::string, Map> g_registry;
+
+    // Wrap overwrites a space with '\n'; folding it back makes the drawn and
+    // converted text one entry. Must stay length-preserving or offsets shift.
+    static std::string Key(const std::string& s) {
+        std::string k = s;
+        for (char& c : k) if (c == '\n') c = ' ';
+        return k;
+    }
+
+    // Not evicted - the backlog re-renders arbitrarily old lines. Only lines
+    // that lost a character register, so it stays small.
+    static void Register(const std::string& sjis, Map lost) {
+        if (sjis.empty() || lost.empty()) return;
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_registry[Key(sjis)] = std::move(lost);
+    }
+
+    static bool Find(const char* sjis, Map& out) {
+        if (!sjis || !*sjis) return false;
+        out.clear();
+
+        std::string q = Key(sjis);
+        std::lock_guard<std::mutex> lock(g_mutex);
+
+        auto it = g_registry.find(q);
+        if (it != g_registry.end()) { out = it->second; return true; }
+
+        // drawHistory joins name + "\n" + message, and the message already
+        // carries wrap newlines, so the join is not reliably the first one.
+        // Both sides must be whole registry entries - matching partial content
+        // would give one line's records to another sharing the same letters.
+        bool any = false;
+        auto merge = [&](const std::string& part, size_t base) {
+            auto p = g_registry.find(Key(part));
+            if (p == g_registry.end()) return false;
+            for (const auto& e : p->second) out[base + e.first] = e.second;
+            any = true;
+            return true;
+        };
+
+        // Split on the raw text, not the folded key, which has no newlines left.
+        std::string raw(sjis);
+        for (size_t nl = raw.find('\n'); nl != std::string::npos; nl = raw.find('\n', nl + 1)) {
+            bool l = merge(raw.substr(0, nl), 0);
+            bool r = merge(raw.substr(nl + 1), nl + 1);
+            if (l || r) break;
+        }
+        return any;
+    }
+
+    // Wrapping only inserts '\n' and deletes spaces, and a dropped character is
+    // never either, so a two-pointer walk realigns the offsets exactly.
+    // A mismatch means an assumption broke: drop the map rather than guess.
+    static Map Remap(const std::string& before, const std::string& after, const Map& src) {
+        Map out;
+        size_t i = 0, j = 0;
+        while (i < before.size() && j < after.size()) {
+            if (before[i] == after[j]) {
+                auto it = src.find(i);
+                if (it != src.end()) out[j] = it->second;
+                i++; j++;
+            }
+            else if (after[j] == '\n') j++;
+            else if (before[i] == ' ')  i++;
+            else return {};
+        }
+        return out;
+    }
+
+    // Active for the duration of one printSub call.
+    static thread_local Map         t_map;
+    static thread_local const char* t_str      = nullptr;
+    static thread_local const void* t_printData = nullptr;
+
+    // printSub's UxPrintData. Iterator set up at 0x10171D40: +24 start,
+    // +28 cursor (CharNextA-walked), so cursor - start is the glyph offset.
+    constexpr size_t kIterStart  = 24;
+    constexpr size_t kIterCursor = 28;
+
+    // 0 when there is nothing to substitute at the current cursor.
+    static wchar_t CharAtCursor() {
+        if (!t_printData || t_map.empty() || g_measuringGlyph) return 0;
+
+        const char* start  = *(const char* const*)((const char*)t_printData + kIterStart);
+        const char* cursor = *(const char* const*)((const char*)t_printData + kIterCursor);
+        if (!start || !cursor || cursor < start) return 0;
+        if (start != t_str) return 0;   // not the string this record describes
+
+        auto it = t_map.find((size_t)(cursor - start));
+        return it == t_map.end() ? 0 : it->second;
+    }
+
+    // No UxPrintData here, so the position comes from the engine's own walk:
+    // it calls CharNextA then GetGlyphOutlineA with no CharNextA between,
+    // so the last CharNextA argument is the glyph being drawn.
+    static thread_local bool        t_toArmed = false;
+    static thread_local const char* t_toBase  = nullptr;  // fragment start
+    static thread_local const char* t_toCur   = nullptr;  // glyph being drawn
+    static thread_local Map         t_toMap;              // offsets within it
+
+    static void Disarm() {
+        t_toArmed = false;
+        t_toBase  = nullptr;
+        t_toCur   = nullptr;
+        t_toMap.clear();
+    }
+
+    // The fragment is an engine-owned copy, so the record is found by content
+    // rather than by pointer. Ambiguity is refused, not guessed.
+    static void FragBegin(const char* frag) {
+        t_toMap.clear();
+        t_toBase = frag;
+        if (!frag || !*frag) return;
+
+        const std::string f = Key(frag);
+
+        std::lock_guard<std::mutex> lock(g_mutex);
+
+        // Exact first, or an unsplit line would be refused for also occurring inside a longer one.
+        auto exact = g_registry.find(f);
+        if (exact != g_registry.end()) { t_toMap = exact->second; return; }
+
+        const Map* hit = nullptr;
+        size_t     hitOff = 0;
+        for (const auto& [key, map] : g_registry) {
+            size_t p = key.find(f);
+            if (p == std::string::npos) continue;
+            if (hit) return;                                        // two lines
+            if (key.find(f, p + 1) != std::string::npos) return;    // twice in one
+            hit = &map;
+            hitOff = p;
+        }
+        if (!hit) return;
+
+        for (const auto& [off, wc] : *hit) {
+            if (off >= hitOff && off < hitOff + f.size())
+                t_toMap[off - hitOff] = wc;
+        }
+    }
+
+    // If the tracked bytes disagree with uChar the walk assumption has broken
+    // on this build; degrade to best-fit spelling rather than a wrong glyph.
+    static wchar_t CharAtTextOut(UINT uChar) {
+        if (!t_toBase || !t_toCur || t_toMap.empty() || g_measuringGlyph) return 0;
+        if (t_toCur < t_toBase) return 0;
+
+        auto it = t_toMap.find((size_t)(t_toCur - t_toBase));
+        if (it == t_toMap.end()) return 0;
+
+        unsigned char a = (unsigned char)t_toCur[0];
+        UINT here = a;
+        if ((a >= 0x81 && a <= 0x9F) || (a >= 0xE0 && a <= 0xFC)) {
+            unsigned char b = (unsigned char)t_toCur[1];
+            if (b) here = ((UINT)a << 8) | b;
+        }
+        if (here != uChar) {
+            static bool s_said = false;
+            if (!s_said) {
+                s_said = true;
+                Log("[ACCENT] fragment cursor out of step (uChar=0x%04X here=0x%04X)"
+                    " - textOut restoration disabled\n", uChar, here);
+            }
+            return 0;
+        }
+        return it->second;
+    }
+}
+
 namespace WordWrap {
     bool IsSjisLead(unsigned char c) {
         return (c >= 0x81 && c <= 0x9F) || (c >= 0xE0 && c <= 0xFC);
     }
 
-    std::string Wrap(const std::string& text, int maxWidth) {
+    // Print context read from RetouchPrintManager
+    struct PrintCtx {
+        LONG rectLeft, rectTop, rectRight, rectBottom;
+        LONG lineHeight;
+        LONG indent;
+        HDC hdc;
+        UINT fuFormat;
+        bool vertical;
+        LOGFONTA logFont;   // this context's font, substitution applied
+    };
+
+    // Private DC for measuring. The engine's own font DC (+0x244) is refcounted
+    // and its acquire/release also drives palette selection, so we don't borrow
+    // it. The engine builds each context's font from a LOGFONTA at +0x1A4
+    // (0x10171220); copying that onto our own DC gives the same metrics.
+    //
+    // Per context, not global: the name box and message body have different
+    // fonts, and measuring the body with the name's font under-counts every
+    // advance, emits no break, and lets the engine cut mid-word.
+    static std::mutex g_fontMutex;
+    static HDC        g_measureDC = nullptr;
+    static HFONT      g_measureFont = nullptr;
+    static LOGFONTA   g_measureFontLf = {};
+
+    static void InvalidateGlyphsForFont(HFONT hf);
+
+    // Private DC carrying a font equivalent to `lf`. Reused across calls; only
+    // rebuilt when the requested LOGFONT actually changes.
+    static HDC GetMeasureDC(const LOGFONTA& lf) {
+        std::lock_guard<std::mutex> lock(g_fontMutex);
+
+        if (!g_measureDC) {
+            g_measureDC = CreateCompatibleDC(nullptr);
+            if (!g_measureDC) return nullptr;
+        }
+
+        if (!g_measureFont || memcmp(&g_measureFontLf, &lf, sizeof(LOGFONTA)) != 0) {
+            // Bypass our own CreateFontIndirectA hook: substitution is already
+            // applied, and re-entering it would flush the glyph cache and log.
+            HFONT nf = g_origCreateFontIndirectA
+                     ? g_origCreateFontIndirectA(&lf)
+                     : CreateFontIndirectA(&lf);
+            if (!nf) return nullptr;
+
+            SelectObject(g_measureDC, nf);
+            if (g_measureFont) {
+                // This font is a cache key. Freeing it without dropping its
+                // entries leaves them to be read by whatever later measure font
+                // GDI reissues the handle value to.
+                InvalidateGlyphsForFont(g_measureFont);
+                DeleteObject(g_measureFont);
+            }
+            g_measureFont = nf;
+            g_measureFontLf = lf;
+        }
+        return g_measureDC;
+    }
+
+    // Glyph advance cache, keyed on (HFONT, char, format)
+    static std::mutex g_glyphCacheMutex;
+    static std::unordered_map<uint64_t, int> g_glyphCache;
+
+    // Drop cached advances for a handle that has been reused for another font.
+    static void InvalidateGlyphsForFont(HFONT hf) {
+        if (!hf) return;
+        const uint64_t prefix = (uint64_t)(uintptr_t)hf << 32;
+
+        std::lock_guard<std::mutex> lock(g_glyphCacheMutex);
+        if (g_glyphCache.empty()) return;
+        for (auto it = g_glyphCache.begin(); it != g_glyphCache.end(); ) {
+            if ((it->first & 0xFFFFFFFF00000000ULL) == prefix) it = g_glyphCache.erase(it);
+            else ++it;
+        }
+    }
+
+    // Release the private measuring DC and font (process detach).
+    static void ReleaseMeasureDC() {
+        std::lock_guard<std::mutex> lock(g_fontMutex);
+        if (g_measureFont) { DeleteObject(g_measureFont); g_measureFont = nullptr; }
+        if (g_measureDC)   { DeleteDC(g_measureDC);       g_measureDC = nullptr; }
+        ZeroMemory(&g_measureFontLf, sizeof(g_measureFontLf));
+    }
+
+    // Read the geometry half of the print context (no DC yet).
+    // pThis is printEx's "this"; the chain matches the engine's own accessor.
+    static bool GetPrintCtx(void* pThis, PrintCtx& out) {
+        if (!pThis) return false;
+
+        void* p1 = *(void**)((char*)pThis + PrintMgrOffsets::Target);
+        if (!p1) return false;
+        void* ctx = *(void**)((char*)p1 + PrintMgrOffsets::FCStringData);
+        if (!ctx) return false;
+
+        auto field = [ctx](size_t off) -> LONG {
+            return *(LONG*)((char*)ctx + off);
+        };
+
+        out.vertical   = (field(PrintCtxOffsets::Flags) & 4) != 0;
+        out.rectLeft   = field(PrintCtxOffsets::RectLeft);
+        out.rectTop    = field(PrintCtxOffsets::RectTop);
+        out.rectRight  = field(PrintCtxOffsets::RectRight);
+        out.rectBottom = field(PrintCtxOffsets::RectBottom);
+        out.lineHeight = field(PrintCtxOffsets::LineHeight);
+        out.indent     = field(PrintCtxOffsets::Indent);
+        out.hdc        = nullptr;   // supplied by GetMeasureDC()
+
+        // Same rasterization format the engine asks for: 4 * (aa != 0) + 1,
+        // i.e. GGO_GRAY4_BITMAP or GGO_BITMAP.
+        unsigned char aaFlag = *((unsigned char*)ctx + PrintCtxOffsets::AntiAlias);
+        out.fuFormat = 4u * (aaFlag != 0) + 1u;
+
+        // This context's own font; the engine builds its HFONT from here.
+        memcpy(&out.logFont, (char*)ctx + PrintCtxOffsets::LogFont, sizeof(LOGFONTA));
+
+        // A rejection silently downgrades the whole feature to character wrap,
+        // so say which check failed and dump what was read. Once per session.
+        auto reject = [&](const char* why) -> bool {
+            static bool s_said = false;
+            if (!s_said) {
+                s_said = true;
+                Log("[WRAP] context rejected (%s) - using character wrap\n", why);
+                Log("[WRAP]   ctx=%p rect=(%d,%d)-(%d,%d) lineHeight=%d indent=%d aa=%u\n",
+                    ctx, out.rectLeft, out.rectTop, out.rectRight, out.rectBottom,
+                    out.lineHeight, out.indent, (unsigned)aaFlag);
+                Log("[WRAP]   font='%s' h=%d weight=%d cs=%d pitch=%u\n",
+                    out.logFont.lfFaceName, out.logFont.lfHeight,
+                    out.logFont.lfWeight, out.logFont.lfCharSet,
+                    (unsigned)out.logFont.lfPitchAndFamily);
+            }
+            return false;
+        };
+
+        if (out.rectRight <= out.rectLeft || out.rectBottom <= out.rectTop)
+            return reject("empty rect");
+        if (out.lineHeight <= 0 || out.lineHeight > 512)
+            return reject("bad lineHeight");
+        if (out.rectRight - out.rectLeft > 8192)
+            return reject("rect too wide");
+        if (out.indent < 0 || out.indent >= out.rectRight - out.rectLeft)
+            return reject("bad indent");
+        if (out.logFont.lfHeight == 0)
+            return reject("font height 0");
+        if (out.logFont.lfFaceName[0] == '\0')
+            return reject("empty face name");
+
+        // The stored LOGFONT is what the engine asked for; what actually renders
+        // is the substituted face, so measure with that.
+        ApplyFontSubstitution(out.logFont);
+
+        return true;
+    }
+
+    // Measure glyph advance. One call suffices - GDI fills identical metrics
+    // with or without a buffer. The scope flag stops substitution
+    // consulting the engine's cursor, which is unrelated to what we measure.
+    static int GlyphAdvance(HDC hdc, UINT ch, UINT fuFormat) {
+        struct MeasureScope {
+            MeasureScope()  { g_measuringGlyph = true;  }
+            ~MeasureScope() { g_measuringGlyph = false; }
+        } scope;
+        HFONT hFont = (HFONT)GetCurrentObject(hdc, OBJ_FONT);
+        // Disjoint bit fields: fuFormat 0..7, ch 8..23, HFONT 32..63
+        uint64_t key = ((uint64_t)(uintptr_t)hFont << 32)
+                     | ((uint64_t)(ch & 0xFFFF) << 8)
+                     | (uint64_t)(fuFormat & 0xFF);
+
+        {
+            std::lock_guard<std::mutex> lock(g_glyphCacheMutex);
+            auto it = g_glyphCache.find(key);
+            if (it != g_glyphCache.end())
+                return it->second;
+        }
+
+        MAT2 mat2 = {};
+        mat2.eM11.value = 1;
+        mat2.eM22.value = 1;
+
+        GLYPHMETRICS gm = {};
+
+        DWORD size = GetGlyphOutlineA(hdc, ch, fuFormat, &gm, 0, nullptr, &mat2);
+        if (size == GDI_ERROR)
+            return -1;
+
+        int advance = gm.gmCellIncX;
+
+        {
+            std::lock_guard<std::mutex> lock(g_glyphCacheMutex);
+            g_glyphCache[key] = advance;
+        }
+
+        return advance;
+    }
+
+    // Kinsoku: characters that may not begin a line -- trailing punctuation,
+    // the prolonged sound mark, closing brackets (even trail) and small kana.
+    static bool IsJpNoLineStart(unsigned char lead, unsigned char trail) {
+        if (lead == Sjis::PunctLead) {
+            if (trail >= Sjis::PunctFirst && trail <= Sjis::PunctLast) return true;
+            if (trail == Sjis::ProlongedMark) return true;
+            if (trail >= Sjis::BracketFirst && trail <= Sjis::BracketLast)
+                return (trail % 2) == 0;   // even closes the pair
+        }
+        unsigned short ch = (unsigned short)((lead << 8) | trail);
+        for (unsigned short k : Sjis::kSmallKana) {
+            if (k == ch) return true;
+        }
+        return false;
+    }
+
+    // Kinsoku: characters that may not end a line -- opening brackets (odd trail).
+    static bool IsJpNoLineEnd(unsigned char lead, unsigned char trail) {
+        if (lead != Sjis::PunctLead) return false;
+        if (trail < Sjis::BracketFirst || trail > Sjis::BracketLast) return false;
+        return (trail % 2) == 1;           // odd opens the pair
+    }
+
+    struct BreakPoint {
+        size_t pos;        // index in result where the '\n' belongs
+        bool   replace;    // true: overwrite a space; false: insert
+        int    widthThru;  // line width accumulated through this point
+    };
+
+    static std::string WrapPixels(const std::string& sjis, const PrintCtx& ctx, int& linesOut) {
+        int budget = (ctx.rectRight - ctx.rectLeft) - ctx.indent - Config::wrapSafetyPx;
+        if (budget <= 0) {
+            linesOut = 1;
+            return sjis;
+        }
+
+        std::string result;
+        result.reserve(sjis.size() + 64);
+
+        int    lineWidth = 0;
+        size_t lineStart = 0;
+        int    lines     = 1;
+        bool   haveBreak = false;
+        BreakPoint br    = {};
+
+        // Emit the newline at the recorded opportunity and re-base the line.
+        auto breakAtOpportunity = [&]() {
+            if (br.replace) result[br.pos] = '\n';
+            else            result.insert(br.pos, 1, '\n');
+
+            lineStart = br.pos + 1;
+            lineWidth -= br.widthThru;
+            if (lineWidth < 0) lineWidth = 0;
+            haveBreak = false;
+            lines++;
+
+            // Runs of spaces: the break consumed one, drop any others so the
+            // new line does not start indented by leftover whitespace.
+            while (lineStart < result.size() && result[lineStart] == ' ') {
+                int sp = GlyphAdvance(ctx.hdc, ' ', ctx.fuFormat);
+                result.erase(lineStart, 1);
+                if (sp > 0) lineWidth -= sp;
+                if (lineWidth < 0) lineWidth = 0;
+            }
+        };
+
+        auto breakHard = [&]() {
+            result += '\n';
+            lineStart = result.size();
+            lineWidth = 0;
+            haveBreak = false;
+            lines++;
+        };
+
+        for (size_t i = 0; i < sjis.size(); ) {
+            unsigned char c = (unsigned char)sjis[i];
+
+            // Author's own newline: honour it and reset
+            if (c == '\n') {
+                result += c;
+                lineStart = result.size();
+                lineWidth = 0;
+                haveBreak = false;
+                lines++;
+                i++;
+                continue;
+            }
+
+            bool dbcs = IsSjisLead(c) && (i + 1 < sjis.size());
+            unsigned char lead = c;
+            unsigned char trail = dbcs ? (unsigned char)sjis[i + 1] : 0;
+            UINT ch = dbcs ? (UINT)((lead << 8) | trail) : (UINT)c;
+
+            int adv = GlyphAdvance(ctx.hdc, ch, ctx.fuFormat);
+            if (adv < 0) adv = ctx.lineHeight / 2;   // missing glyph: approximate
+
+            // Would this glyph leave the box?
+            if (lineWidth + adv > budget && lineWidth > 0) {
+                if (haveBreak && br.pos > lineStart) breakAtOpportunity();
+                else                                 breakHard();
+            }
+
+            result += (char)lead;
+            if (dbcs) result += (char)trail;
+            lineWidth += adv;
+
+            if (dbcs) {
+                // Any boundary between two double-byte chars is a legal break,
+                // subject to kinsoku on both sides.
+                if (!IsJpNoLineEnd(lead, trail) && i + 3 < sjis.size()) {
+                    unsigned char nLead = (unsigned char)sjis[i + 2];
+                    unsigned char nTrail = (unsigned char)sjis[i + 3];
+                    if (IsSjisLead(nLead) && !IsJpNoLineStart(nLead, nTrail)) {
+                        br = { result.size(), false, lineWidth };
+                        haveBreak = true;
+                    }
+                }
+                i += 2;
+            } else {
+                // A space is the break opportunity for English, and it is
+                // replaced by the newline rather than left dangling.
+                if (c == ' ') {
+                    br = { result.size() - 1, true, lineWidth };
+                    haveBreak = true;
+                }
+                i++;
+            }
+        }
+
+        linesOut = lines;
+        return result;
+    }
+
+    // Character-count wrap (old behaviour, kept as fallback)
+    static std::string WrapByChars(const std::string& text, int maxWidth) {
         if (text.empty() || maxWidth <= 0) return text;
 
         std::string result;
@@ -1138,7 +2127,6 @@ namespace WordWrap {
         for (size_t i = 0; i < text.size(); ) {
             unsigned char c = (unsigned char)text[i];
 
-            // Existing newline - reset
             if (c == '\n') {
                 result += c;
                 lineLen = 0;
@@ -1148,7 +2136,6 @@ namespace WordWrap {
                 continue;
             }
 
-            // SJIS double-byte (Japanese) - don't count for word wrap
             if (IsSjisLead(c) && i + 1 < text.size()) {
                 result += text[i];
                 result += text[i + 1];
@@ -1157,7 +2144,6 @@ namespace WordWrap {
                 continue;
             }
 
-            // Remember last space position for word wrap
             if (c == ' ') {
                 lastSpace = result.size();
             }
@@ -1165,22 +2151,94 @@ namespace WordWrap {
             result += c;
             lineLen++;
 
-            // Need to wrap?
             if (lineLen >= maxWidth) {
                 if (lastSpace != std::string::npos && lastSpace > lineStart) {
-                    // Replace space with newline
                     result[lastSpace] = '\n';
                     lineLen = (int)(result.size() - lastSpace - 1);
                     lineStart = lastSpace + 1;
                     lastSpace = std::string::npos;
                 }
-                // else: no good break point, let it overflow (game will handle)
             }
 
             i++;
         }
 
         return result;
+    }
+
+    static std::mutex g_overflowMutex;
+    static std::unordered_set<std::string> g_overflowLogged;
+
+    static void ReportOverflow(const std::string& file, int index,
+                               int needLines, int maxLines, int boxPx,
+                               const std::string& sjis) {
+        if (!Config::warnOnOverflow) return;
+
+        std::string key = file + ":" + std::to_string(index);
+        {
+            std::lock_guard<std::mutex> lock(g_overflowMutex);
+            if (g_overflowLogged.count(key)) return;
+            g_overflowLogged.insert(key);
+        }
+
+        std::string utf8 = Encoding::SjisToUtf8(sjis.c_str());
+        // Collapse the newlines we just inserted so the log stays one line
+        for (size_t p = 0; (p = utf8.find('\n', p)) != std::string::npos; )
+            utf8.replace(p, 1, " / ");
+
+        Log("[WRAP] OVERFLOW %s  needs %d lines, box holds %d  (box=%dpx)\n",
+            key.c_str(), needLines, maxLines, boxPx);
+        Log("[WRAP]   \"%s\"\n", utf8.c_str());
+    }
+
+    std::string WrapForPrint(void* printMgr, const std::string& sjis) {
+        if (sjis.empty()) return sjis;
+        if (Config::wrapMode == Config::WrapMode::Off) return sjis;
+
+        if (Config::wrapMode == Config::WrapMode::Pixel) {
+            PrintCtx ctx;
+            if (GetPrintCtx(printMgr, ctx) && !ctx.vertical) {
+                // Our own DC, carrying a copy of *this* context's font.
+                HDC hdc = GetMeasureDC(ctx.logFont);
+
+                if (hdc) {
+                    ctx.hdc = hdc;
+
+                    int maxLines = (ctx.rectBottom - ctx.rectTop) / ctx.lineHeight;
+
+                    // One-time report so the measured geometry is in the log
+                    static bool s_reported = false;
+                    if (!s_reported) {
+                        s_reported = true;
+                        Log("[WRAP] pixel mode active: box=%dpx (%d..%d) lineHeight=%d "
+                            "maxLines=%d indent=%d fmt=%u safety=%dpx font=%s h=%d\n",
+                            ctx.rectRight - ctx.rectLeft, ctx.rectLeft, ctx.rectRight,
+                            ctx.lineHeight, maxLines, ctx.indent, ctx.fuFormat,
+                            Config::wrapSafetyPx, ctx.logFont.lfFaceName,
+                            ctx.logFont.lfHeight);
+                    }
+
+                    int lines = 1;
+                    std::string wrapped = WrapPixels(sjis, ctx, lines);
+
+                    if (maxLines > 0 && lines > maxLines) {
+                        ReportOverflow(CurrentSceneFile(), t_cmdIndex,
+                                       lines, maxLines,
+                                       ctx.rectRight - ctx.rectLeft, wrapped);
+                    }
+                    return wrapped;
+                }
+
+                // Expected exactly once, before the engine has drawn any glyph.
+                static bool s_warnedNoDc = false;
+                if (!s_warnedNoDc) {
+                    s_warnedNoDc = true;
+                    Log("[WRAP] font not captured yet - character wrap for this line\n");
+                }
+            }
+        }
+
+        return WrapByChars(sjis, Config::wordWrapWidth);
     }
 }
 
@@ -1220,9 +2278,9 @@ static DWORD WINAPI HotkeyThreadProc(LPVOID) {
 }
 
 //=============================================================================
-// Character ID → Original Name Lookup (from char_table.tsv)
+// Character ID -> Original Name Lookup (from char_table.tsv)
 //=============================================================================
-static std::unordered_map<int, std::string> g_charIdToName;  // ID → original JP name
+static std::unordered_map<int, std::string> g_charIdToName;  // ID -> original JP name
 
 static void LoadCharIdTable(const char* path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -1275,6 +2333,35 @@ static unsigned int __fastcall CalcIniValue_Hook(void* pThis, void* edx) {
 }
 
 //=============================================================================
+// Hook: RetouchSystem::cmdMessage()
+//=============================================================================
+// Runs immediately before the say() that renders the line. CMD_DATA[0x00] is
+// the sequential command index assigned during load,
+// which matches the INDEX column in the TSV one-to-one
+//
+// CMD_DATA layout, from RetouchSystem::liteExec and RetouchSystem::liteCommandInfo:
+//
+//   +0x04   header dword: opcode<<0 | nparams<<16 | nstrings<<24 | flags<<28
+//   +0x08   int32 params[]
+//   +0x60   string records, 12 bytes each; the char* is at record+20
+//   +0xD4   command index          <-- liteExec: mov [edi+0D4h], eax
+//   0xD8    total record stride    <-- liteExec: imul edi, 0D8h
+constexpr size_t kCmdDataIndexOffset = 0xD4;
+
+typedef void(__thiscall* Fn_CmdMessage)(void* pThis, void* cmdData, const char* arg);
+static Fn_CmdMessage g_origCmdMessage = nullptr;
+
+static void __fastcall CmdMessage_Hook(void* pThis, void* edx, void* cmdData, const char* arg)
+{
+    int prev = t_cmdIndex;
+    t_cmdIndex = cmdData
+        ? *(int*)((char*)cmdData + kCmdDataIndexOffset)
+        : -1;
+    g_origCmdMessage(pThis, cmdData, arg);
+    t_cmdIndex = prev;   // restore: say() is also reached from other paths
+}
+
+//=============================================================================
 // Hook: RetouchAdvCharacter::say()
 //=============================================================================
 typedef void(__thiscall* Fn_AdvCharSay)(
@@ -1296,50 +2383,61 @@ static void __fastcall AdvCharSay_Hook(
         int charId = *((int*)((uintptr_t)pThis + 4));
 
         if (charId > 0) {
-            // Step 1: CharID → original name
+            // char -> name
             auto it = g_charIdToName.find(charId);
             if (it != g_charIdToName.end()) {
                 const std::string& origName = it->second;
 
-                // Step 2: original name → translation (via unique_names.tsv)
+                // name -> translation
                 std::string sjisName = Encoding::Utf8ToSjis(origName.c_str());
-                const std::string* tlUtf8 = g_translationDB.FindNameTranslation(sjisName.c_str(), nullptr);
+                std::string tlUtf8 = g_translationDB.FindNameTranslation(sjisName.c_str(), nullptr);
 
-                if (tlUtf8) {
-                    std::string sjis = Encoding::Utf8ToSjis(tlUtf8->c_str());
+                if (!tlUtf8.empty()) {
+                    CharRestore::Map lost;
+                    std::string sjis = Encoding::Utf8ToSjisTracked(tlUtf8.c_str(), lost);
                     if (!sjis.empty()) {
+                        CharRestore::Register(sjis, std::move(lost));
                         finalName = g_stringPool.Store(sjis);
                         if (Config::enableTextLogging) {
-                            Log("[SAY] CharID %d (%s) -> %s\n", charId, origName.c_str(), tlUtf8->c_str());
+                            Log("[SAY] CharID %d (%s) -> %s\n", charId, origName.c_str(), tlUtf8.c_str());
                         }
                     }
                 } else {
-                    // No translation, use original name
+                    // no translation, use original name
                     finalName = g_stringPool.Store(sjisName);
                 }
             }
         }
     }
-    // Translate inline name
+    // translate inline name
     else if (name && *name) {
-        const std::string* tlUtf8 = g_translationDB.FindNameTranslation(name, message);
-        if (tlUtf8) {
-            std::string sjis = Encoding::Utf8ToSjis(tlUtf8->c_str());
+        std::string tlUtf8 = g_translationDB.FindNameTranslation(name, message);
+        if (!tlUtf8.empty()) {
+            CharRestore::Map lost;
+            std::string sjis = Encoding::Utf8ToSjisTracked(tlUtf8.c_str(), lost);
             if (!sjis.empty()) {
+                CharRestore::Register(sjis, std::move(lost));
                 finalName = g_stringPool.Store(sjis);
             }
         }
     }
 
-    // Translate message
+    // Translate message. t_cmdIndex is set by CmdMessage_Hook when this say()
+    // came from a MESSAGE command, giving an exact (file, index) match instead
+    // of a text match -- the only way to disambiguate lines whose text repeats.
+    std::string msgAsRendered;   // pre-conversion UTF-8; SJIS drops the accents
     if (message && *message) {
-        const std::string* tlUtf8 = g_translationDB.FindMessageTranslation(message);
-        if (tlUtf8) {
-            std::string normalized = TextFix::NormalizeUtf8(*tlUtf8);
-            std::string sjis = Encoding::Utf8ToSjis(normalized.c_str());
+        std::string tlUtf8 = g_translationDB.FindMessageTranslation(
+            message, CurrentSceneFile(), t_cmdIndex);
+        if (!tlUtf8.empty()) {
+            msgAsRendered = tlUtf8;
+            CharRestore::Map lost;
+            std::string sjis = Encoding::Utf8ToSjisTracked(tlUtf8.c_str(), lost);
             if (!sjis.empty()) {
-                std::string wrapped = WordWrap::Wrap(sjis, Config::wordWrapWidth);
-                finalMsg = g_stringPool.Store(wrapped);
+                // Translate only. printEx runs downstream of this and owns the
+                // wrapping, where the text box and its font are reachable.
+                CharRestore::Register(sjis, std::move(lost));
+                finalMsg = g_stringPool.Store(sjis);
             }
         }
     }
@@ -1355,13 +2453,44 @@ static void __fastcall AdvCharSay_Hook(
 
         if (finalName != name || finalMsg != message) {
             std::string tlNameUtf8 = finalName ? Encoding::SjisToUtf8(finalName) : "";
-            std::string tlMsgUtf8 = finalMsg ? Encoding::SjisToUtf8(finalMsg) : "";
+            std::string tlMsgUtf8 = !msgAsRendered.empty()
+                                  ? msgAsRendered
+                                  : (finalMsg ? Encoding::SjisToUtf8(finalMsg) : "");
             Log("  --> name=\"%s\"\n", tlNameUtf8.c_str());
             Log("  --> msg=\"%s\"\n", tlMsgUtf8.c_str());
         }
     }
 
     g_origAdvCharSay(pThis, voiceId, finalName, finalMsg, flag, flags, p1, p2, p3, printParam);
+}
+
+//=============================================================================
+// Hook: RetouchPrintManager::printSub()
+//=============================================================================
+// Carries the UxPrintData that owns the print cursor.
+typedef char(__thiscall* Fn_PrintSub)(void* pThis, const char* str, void* printData,
+                                      unsigned long flags);
+static Fn_PrintSub g_origPrintSub = nullptr;
+
+static char __fastcall PrintSub_Hook(void* pThis, void* edx, const char* str,
+                                     void* printData, unsigned long flags)
+{
+    // Recurses, so save and restore rather than clear.
+    const void*      prevData = CharRestore::t_printData;
+    const char*      prevStr  = CharRestore::t_str;
+    CharRestore::Map prevMap;
+    prevMap.swap(CharRestore::t_map);
+
+    CharRestore::t_printData = printData;
+    CharRestore::t_str       = str;
+    if (!CharRestore::Find(str, CharRestore::t_map)) CharRestore::t_map.clear();
+
+    char r = g_origPrintSub(pThis, str, printData, flags);
+
+    CharRestore::t_printData = prevData;
+    CharRestore::t_str       = prevStr;
+    CharRestore::t_map.swap(prevMap);
+    return r;
 }
 
 //=============================================================================
@@ -1381,18 +2510,70 @@ static void __fastcall PrintEx_Hook(
     const char* finalMsg = message;
 
     if (message && *message) {
-        const std::string* tlUtf8 = g_translationDB.FindMessageTranslation(message);
-        if (tlUtf8) {
-            std::string normalized = TextFix::NormalizeUtf8(*tlUtf8);
-            std::string sjis = Encoding::Utf8ToSjis(normalized.c_str());
-            if (!sjis.empty()) {
-                std::string wrapped = WordWrap::Wrap(sjis, Config::wordWrapWidth);
-                finalMsg = g_stringPool.Store(wrapped);
+        // say() runs upstream and has usually already substituted the English
+        // text, so a lookup here normally misses. Wrap whatever we are handed
+        // rather than only text translated at this level -- this is the only
+        // place with the text box and its font.
+        std::string sjis;
+        CharRestore::Map lost;
+
+        std::string tlUtf8 = g_translationDB.FindMessageTranslation(
+            message, CurrentSceneFile(), t_cmdIndex);
+        if (!tlUtf8.empty()) {
+            sjis = Encoding::Utf8ToSjisTracked(tlUtf8.c_str(), lost);
+            CharRestore::Register(sjis, lost);
+        }
+        if (sjis.empty()) {
+            sjis = message;
+            CharRestore::Find(message, lost);   // registered upstream by say()
+        }
+
+        std::string wrapped = WordWrap::WrapForPrint(pThis, sjis);
+        if (wrapped != message) {
+            finalMsg = g_stringPool.Store(wrapped);
+        }
+
+        // Offsets were taken before wrapping; the engine walks the wrapped
+        // text, so register that form too.
+        if (!lost.empty() && wrapped != sjis) {
+            auto moved = CharRestore::Remap(sjis, wrapped, lost);
+            if (moved.size() == lost.size()) {
+                CharRestore::Register(wrapped, std::move(moved));
+            }
+            else {
+                Log("[ACCENT] remap lost %zu of %zu entries - disabled for this line\n",
+                    lost.size() - moved.size(), lost.size());
             }
         }
     }
 
     g_origPrintEx(pThis, charId, msgId, name, finalMsg, flags, linkData);
+}
+
+//=============================================================================
+// Hook: RetouchPrintManager::drawHistory() - backlog repaint
+//=============================================================================
+// Repaints one backlog entry. The call path matters:
+//
+//   cmdMessage                 <- CmdMessage_Hook sets t_cmdIndex
+//     say()
+//       printEngine (virtual)
+//         messageEngine
+//           printEx            <- the live line
+//           hitwait()          <- input wait; backlog UI runs here
+//             prevHistory -> drawHistory -> printEx
+//
+// That last printEx is still inside cmdMessage, so t_cmdIndex is the live line's
+// index and rewinding showed the current message for every entry.
+typedef void(__thiscall* Fn_DrawHistory)(void* pThis, void* container);
+static Fn_DrawHistory g_origDrawHistory = nullptr;
+
+static void __fastcall DrawHistory_Hook(void* pThis, void* edx, void* container)
+{
+    bool prev = t_inHistory;
+    t_inHistory = true;
+    g_origDrawHistory(pThis, container);
+    t_inHistory = prev;
 }
 
 //=============================================================================
@@ -1446,12 +2627,14 @@ static int __fastcall SaveDataTitle_Hook(
             g_currentLabel = Encoding::SjisToUtf8(labelSjis);
         }
 
-        const std::string* translated = g_translationDB.FindLabelTranslation(labelSjis);
+        std::string translated = g_translationDB.FindLabelTranslation(labelSjis);
 
-        if (translated) {
-            translatedSjis = Encoding::Utf8ToSjis(translated->c_str());
+        if (!translated.empty()) {
+            CharRestore::Map lost;
+            translatedSjis = Encoding::Utf8ToSjisTracked(translated.c_str(), lost);
+            CharRestore::Register(translatedSjis, std::move(lost));
             finalLabel = translatedSjis.c_str();
-            Log("[SAVE] Found translation: \"%s\"\n", translated->c_str());
+            Log("[SAVE] Found translation: \"%s\"\n", translated.c_str());
         } else {
             Log("[SAVE] No translation found!\n");
         }
@@ -1481,17 +2664,19 @@ static void __fastcall PrepareQuestion_Hook(void* pThis, void* edx, int choiceId
     const char* finalText = text;
 
     if (text && *text) {
-        const std::string* translated = g_translationDB.FindMessageTranslation(text);
-        if (translated) {
-            std::string sjis = Encoding::Utf8ToSjis(translated->c_str());
+        std::string translated = g_translationDB.FindMessageTranslation(text);
+        if (!translated.empty()) {
+            CharRestore::Map lost;
+            std::string sjis = Encoding::Utf8ToSjisTracked(translated.c_str(), lost);
             if (!sjis.empty()) {
+                CharRestore::Register(sjis, std::move(lost));
                 finalText = g_stringPool.Store(sjis);
 
                 if (Config::enableTextLogging) {
                     Log("[CHOICE] %d: \"%s\" -> \"%s\"\n",
                         choiceId,
                         Encoding::SjisToUtf8(text).c_str(),
-                        translated->c_str());
+                        translated.c_str());
                 }
             }
         }
@@ -1601,17 +2786,190 @@ typedef void(WINAPI* Fn_OutputDebugStringA)(LPCSTR lpOutputString);
 static Fn_OutputDebugStringA g_origOutputDebugStringA = nullptr;
 
 static void WINAPI OutputDebugStringA_Hook(LPCSTR lpOutputString) {
-    // Only show in console when debug mode is active
-    if (DebugJump::g_debugModeActive && lpOutputString && *lpOutputString) {
-        Log("[GAME] %s", lpOutputString);
-        size_t len = strlen(lpOutputString);
-        if (len > 0 && lpOutputString[len-1] != '\n') {
-            Log("\n");
+    if (lpOutputString && *lpOutputString) {
+        bool isOverflowWarning =
+            (strncmp(lpOutputString, "[WARN] ", 7) == 0) ||
+            (strstr(lpOutputString, " in:") != nullptr &&
+             strchr(lpOutputString, ')') != nullptr);
+
+        if (isOverflowWarning && Config::warnOnOverflow && !DebugJump::g_debugModeActive) {
+            std::string scene = CurrentSceneFile();
+            // The engine emits SJIS; the log is UTF-8.
+            std::string text = Encoding::SjisToUtf8(lpOutputString);
+            while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
+                text.pop_back();
+            }
+            Log("[WRAP] ENGINE OVERFLOW %s:%d  %s\n",
+                scene.empty() ? "?" : scene.c_str(), t_cmdIndex, text.c_str());
+        }
+
+        if (DebugJump::g_debugModeActive) {
+            Log("[GAME] %s", lpOutputString);
+            size_t len = strlen(lpOutputString);
+            if (len > 0 && lpOutputString[len - 1] != '\n') {
+                Log("\n");
+            }
         }
     }
 
     // Always call original
     g_origOutputDebugStringA(lpOutputString);
+}
+
+//=============================================================================
+// textOut renderer detection (both are named gdi32 imports)
+//=============================================================================
+// Both renderers open by measuring " " then the fullwidth space - the only two
+// characters they never rasterize. The pair runs once per call, which is what
+// re-bases each outline pass.
+typedef BOOL(WINAPI* Fn_GetTextExtentPoint32A)(HDC, LPCSTR, int, LPSIZE);
+static Fn_GetTextExtentPoint32A g_origGetTextExtentPoint32A = nullptr;
+
+static BOOL WINAPI GetTextExtentPoint32A_Hook(HDC hdc, LPCSTR lpString, int c, LPSIZE psizl) {
+    static thread_local bool s_sawSpace = false;
+    if (lpString) {
+        if (c == 1 && lpString[0] == ' ') {
+            s_sawSpace = true;
+        }
+        else if (c == 2 && s_sawSpace &&
+                 (unsigned char)lpString[0] == 0x81 &&
+                 (unsigned char)lpString[1] == 0x40) {
+            s_sawSpace = false;
+            CharRestore::Disarm();
+            CharRestore::t_toArmed = true;
+        }
+        else {
+            s_sawSpace = false;
+        }
+    }
+    return g_origGetTextExtentPoint32A(hdc, lpString, c, psizl);
+}
+
+// Called by the two renderers and by the glyph loop's metrics helper. Only the
+// former arrives armed with the walk not yet started; anything else is stale.
+typedef UINT(WINAPI* Fn_GetOutlineTextMetricsA)(HDC, UINT, LPOUTLINETEXTMETRICA);
+static Fn_GetOutlineTextMetricsA g_origGetOutlineTextMetricsA = nullptr;
+
+static UINT WINAPI GetOutlineTextMetricsA_Hook(HDC hdc, UINT cjCopy, LPOUTLINETEXTMETRICA potm) {
+    if (!(CharRestore::t_toArmed && !CharRestore::t_toBase)) CharRestore::Disarm();
+    return g_origGetOutlineTextMetricsA(hdc, cjCopy, potm);
+}
+
+//=============================================================================
+// Japanese fallback for a Latin-only custom face
+//=============================================================================
+// A Latin-only face keeps its name at DEFAULT_CHARSET but has no Japanese
+// glyphs, so untranslated lines would rasterize as notdef boxes. Those requests
+// go to a Gothic face of the same metrics instead. Keyed on metrics, not on the
+// engine's HFONT: the engine rebuilds its fonts freely and a handle-keyed table
+// would dangle unless it shadowed every DeleteObject.
+namespace JpFallback {
+    static std::mutex g_mutex;
+    static std::unordered_map<uint64_t, HFONT> g_fonts;
+    static std::unordered_map<uint64_t, bool>  g_missing;   // (HFONT, wchar) -> absent
+
+    // Can't pick by pitch: the engine hardcodes FIXED_PITCH everywhere and puts
+    // proportionality in the face name, which we have already overwritten.
+    static HFONT FontFor(const LOGFONTA& lf) {
+        const uint64_t key = ((uint64_t)(uint32_t)lf.lfHeight << 32)
+                           | ((uint64_t)(uint16_t)lf.lfWeight << 16)
+                           | (uint64_t)(lf.lfItalic != 0);
+
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_fonts.find(key);
+        if (it != g_fonts.end()) return it->second;
+
+        LOGFONTA jp = lf;
+        jp.lfCharSet = SHIFTJIS_CHARSET;
+        strncpy_s(jp.lfFaceName,
+                  Config::fontFallbackJp[0] ? Config::fontFallbackJp : "MS Gothic",
+                  _TRUNCATE);
+
+        // Bypass our own hook, which would substitute this straight back.
+        HFONT hf = g_origCreateFontIndirectA ? g_origCreateFontIndirectA(&jp)
+                                             : CreateFontIndirectA(&jp);
+        Log("[FONT] Japanese fallback -> %s (h=%d weight=%d) %s\n",
+            jp.lfFaceName, jp.lfHeight, jp.lfWeight, hf ? "ok" : "FAILED");
+        g_fonts[key] = hf;
+        return hf;
+    }
+
+    // The font to swap in for this request, or null to leave the DC alone.
+    static HFONT For(HDC hdc, UINT uChar) {
+        if (!FontProbe::g_relaxed.load(std::memory_order_relaxed)) return nullptr;
+        if (uChar < 0x80) return nullptr;      // ASCII: the custom face has it
+
+        HFONT cur = (HFONT)GetCurrentObject(hdc, OBJ_FONT);
+        if (!cur) return nullptr;
+
+        LOGFONTA lf = {};
+        if (!GetObjectA(cur, sizeof(lf), &lf)) return nullptr;
+        if (lf.lfCharSet == SHIFTJIS_CHARSET) return nullptr;   // already Japanese
+
+        return FontFor(lf);
+    }
+
+    // Same, for a restored character the custom face may simply not carry.
+    // Without this a face missing one glyph rasterizes a notdef box and says
+    // nothing about it.
+    static HFONT ForMissingGlyph(HDC hdc, wchar_t wc) {
+        if (!FontProbe::g_relaxed.load(std::memory_order_relaxed)) return nullptr;
+
+        HFONT cur = (HFONT)GetCurrentObject(hdc, OBJ_FONT);
+        if (!cur) return nullptr;
+
+        const uint64_t key = ((uint64_t)(uintptr_t)cur << 32) | (uint64_t)wc;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            auto it = g_missing.find(key);
+            if (it != g_missing.end() && !it->second) return nullptr;
+        }
+
+        WORD gi = 0;
+        if (GetGlyphIndicesW(hdc, &wc, 1, &gi, GGI_MARK_NONEXISTING_GLYPHS) == GDI_ERROR)
+            return nullptr;
+        const bool absent = (gi == 0xFFFF);
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_missing[key] = absent;
+        }
+        if (!absent) return nullptr;
+
+        LOGFONTA lf = {};
+        if (!GetObjectA(cur, sizeof(lf), &lf)) return nullptr;
+
+        static std::mutex warnMutex;
+        static std::unordered_set<unsigned> warned;
+        {
+            std::lock_guard<std::mutex> lock(warnMutex);
+            if (warned.insert((unsigned)wc).second)
+                Log("[FONT] '%s' has no glyph for U+%04X - drawing it from the"
+                    " fallback face\n", lf.lfFaceName, (unsigned)wc);
+        }
+        return FontFor(lf);
+    }
+
+    // g_missing is keyed on HFONT, and GDI reuses handle values; a recycled one
+    // would carry the old face's answer. g_fonts is keyed on metrics and holds
+    // our own handles, so it stays.
+    static void InvalidateForFont(HFONT hf) {
+        if (!hf) return;
+        const uint64_t prefix = (uint64_t)(uintptr_t)hf << 32;
+
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_missing.empty()) return;
+        for (auto it = g_missing.begin(); it != g_missing.end(); ) {
+            if ((it->first & 0xFFFFFFFF00000000ULL) == prefix) it = g_missing.erase(it);
+            else ++it;
+        }
+    }
+
+    static void Release() {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (auto& kv : g_fonts) if (kv.second) DeleteObject(kv.second);
+        g_fonts.clear();
+        g_missing.clear();
+    }
 }
 
 //=============================================================================
@@ -1629,10 +2987,37 @@ static DWORD WINAPI GetGlyphOutlineA_Hook(
     LPGLYPHMETRICS lpgm, DWORD cjBuffer,
     LPVOID pvBuffer, const MAT2* lpmat2)
 {
-    DWORD result = g_origGetGlyphOutlineA(hdc, uChar, fuFormat, lpgm, cjBuffer, pvBuffer, lpmat2);
+    DWORD result;
+    // One or the other, never a fallback chain: inside a renderer walk the
+    // UxPrintData cursor is frozen where the last glyph loop left it.
+    wchar_t sub = (CharRestore::t_toArmed && CharRestore::t_toBase)
+                ? CharRestore::CharAtTextOut(uChar)
+                : CharRestore::CharAtCursor();
+    if (wchar_t wc = sub) {
+        // Deliberately the DC's own font: restored characters are the Latin
+        // ones SJIS dropped, and the custom face is what should draw them --
+        // unless it has no such glyph.
+        if (HFONT fb = JpFallback::ForMissingGlyph(hdc, wc)) {
+            HGDIOBJ prev = SelectObject(hdc, fb);
+            result = GetGlyphOutlineW(hdc, (UINT)wc, fuFormat, lpgm, cjBuffer, pvBuffer, lpmat2);
+            SelectObject(hdc, prev);
+        } else {
+            result = GetGlyphOutlineW(hdc, (UINT)wc, fuFormat, lpgm, cjBuffer, pvBuffer, lpmat2);
+        }
+    }
+    else if (HFONT jp = JpFallback::For(hdc, uChar)) {
+        HGDIOBJ prev = SelectObject(hdc, jp);
+        result = g_origGetGlyphOutlineA(hdc, uChar, fuFormat, lpgm, cjBuffer, pvBuffer, lpmat2);
+        SelectObject(hdc, prev);
+    }
+    else {
+        result = g_origGetGlyphOutlineA(hdc, uChar, fuFormat, lpgm, cjBuffer, pvBuffer, lpmat2);
+    }
 
-    // Fix negative origin.x
-    if (lpgm && pvBuffer && result != GDI_ERROR) {
+    // gmCellIncX must move with the clamp: clamping alone shifts the overlap
+    // onto the next glyph. Ungated - the metrics path (0x10175390) passes no
+    // buffer, and gating on that made it disagree with the renderer.
+    if (lpgm && result != GDI_ERROR) {
         if (lpgm->gmptGlyphOrigin.x < 0) {
             int offset = -lpgm->gmptGlyphOrigin.x;
             lpgm->gmptGlyphOrigin.x = 0;
@@ -1646,42 +3031,28 @@ static DWORD WINAPI GetGlyphOutlineA_Hook(
 //=============================================================================
 // Font Replacement Hook
 //=============================================================================
-typedef HFONT(WINAPI* Fn_CreateFontIndirectA)(const LOGFONTA*);
-static Fn_CreateFontIndirectA g_origCreateFontIndirectA = nullptr;
-
 static HFONT WINAPI CreateFontIndirectA_Hook(const LOGFONTA* lf) {
     if (lf) {
         LOGFONTA modified = *lf;
-
         std::string origName = Encoding::SjisToUtf8(lf->lfFaceName);
-        const char* newFont = nullptr;
 
-        // Check for proportional (Ｐ in SJIS = 0x820x6F)
-        bool isProportional = (strstr(lf->lfFaceName, "\x82\x6F") != nullptr);
+        // Same substitution the word wrapper measures with -- see
+        // ApplyFontSubstitution's note on why it must be shared.
+        ApplyFontSubstitution(modified);
 
-        if (isProportional) {
-            // Proportional font
-            if (Config::fontNameProportional[0] != '\0') {
-                newFont = Config::fontNameProportional;
-            } else if (Config::fontName[0] != '\0') {
-                newFont = Config::fontName;  // Fallback to main
-            } else {
-                newFont = "MS PGothic";  // Default
-            }
-        } else {
-            // Non-proportional font
-            if (Config::fontName[0] != '\0') {
-                newFont = Config::fontName;
-            } else {
-                newFont = "MS Gothic";  // Default
-            }
-        }
+        Log("[FONT] %s (h=%d, cs=%d) -> %s (cs=%d)\n",
+            origName.c_str(), lf->lfHeight, lf->lfCharSet,
+            modified.lfFaceName, modified.lfCharSet);
 
-        Log("[FONT] %s (h=%d, cs=%d) -> %s (cs=128)\n", origName.c_str(), lf->lfHeight, lf->lfCharSet, newFont);
+        HFONT created = g_origCreateFontIndirectA(&modified);
 
-        strcpy_s(modified.lfFaceName, newFont);
-        modified.lfCharSet = SHIFTJIS_CHARSET;
-        return g_origCreateFontIndirectA(&modified);
+        // Advances are cached per HFONT; a recycled handle would inherit the old
+        // font's widths. Targeted rather than a full flush - fonts are recreated
+        // often enough that flushing everything would defeat the cache.
+        WordWrap::InvalidateGlyphsForFont(created);
+        JpFallback::InvalidateForFont(created);
+
+        return created;
     }
     return g_origCreateFontIndirectA(lf);
 }
@@ -1923,6 +3294,15 @@ typedef LPSTR(WINAPI* Fn_CharNextA)(LPCSTR lpsz);
 static Fn_CharNextA g_origCharNextA = nullptr;
 
 static LPSTR WINAPI CharNextA_Hook(LPCSTR lpsz) {
+    // The textOut renderers step their fragment with this call and rasterize
+    // before advancing, so this argument is the glyph GetGlyphOutlineA is
+    // about to be asked for. The first call after the renderer prologue
+    // establishes the fragment base.
+    if (CharRestore::t_toArmed && lpsz) {
+        CharRestore::t_toCur = lpsz;
+        if (!CharRestore::t_toBase) CharRestore::FragBegin(lpsz);
+    }
+
     if (!lpsz || !*lpsz)
         return (LPSTR)lpsz;
 
@@ -1952,14 +3332,6 @@ static UINT WINAPI GetOEMCP_Hook() {
     return 932;
 }
 
-typedef UINT(__cdecl* Fn_GetCodePage)();
-static Fn_GetCodePage g_origGetCodePage = nullptr;
-
-static UINT __cdecl GetCodePage_Hook() {
-    // Always return Japanese Shift-JIS codepage
-    return 932;
-}
-
 //=============================================================================
 // Debug Console Commands
 //=============================================================================
@@ -1976,7 +3348,7 @@ static void ProcessDebugCommand(const std::string& cmd) {
         Log("  scene        - Show current scene\n");
         Log("  find <text>  - Search for text in DB\n");
         Log("  log on/off   - Toggle logging\n");
-        Log("  goto <file> [block] - Jump to scene\n");
+        Log("  goto <file>  - Jump to scene\n");
         Log("  list         - List common scenes\n");
         Log("========================\n\n");
     } else if (verb == "debug") {
@@ -2041,32 +3413,28 @@ static void ProcessDebugCommand(const std::string& cmd) {
     }
     else if (verb == "goto") {
         std::string sceneName;
-        int blockId = 0;
-        iss >> sceneName >> blockId;
+        iss >> sceneName;
 
         if (sceneName.empty()) {
-            Log("\n[DEBUG] Usage: goto <sceneName> [blockId]\n");
+            Log("\n[DEBUG] Usage: goto <sceneName>\n");
             Log("[DEBUG] Examples:\n");
             Log("[DEBUG]   goto y0011001       - Start of prologue\n");
             Log("[DEBUG]   goto y1034001       - Chapter 1, Day 3-4\n");
-            Log("[DEBUG]   goto y1034001 1010  - Chapter 1, Day 3-4, Block 1010\n");
             Log("[DEBUG]\n");
             Log("[DEBUG] Jump happens on next scene transition.\n");
             Log("[DEBUG] Advance the game or return to title to trigger.\n\n");
         } else {
             std::lock_guard<std::mutex> lock(DebugJump::g_mutex);
             DebugJump::g_pendingScene = sceneName;
-            DebugJump::g_pendingBlockId = blockId;
             DebugJump::g_jumpRequested = true;
 
             Log("\n[DEBUG] =======================================\n");
-            Log("[DEBUG] Jump queued: %s", sceneName.c_str());
-            if (blockId > 0) Log(" (block %d)", blockId);
-            Log("\n");
+            Log("[DEBUG] Jump queued: %s\n", sceneName.c_str());
             Log("[DEBUG] Advance game or use title menu to trigger.\n");
             Log("[DEBUG] =======================================\n\n");
         }
     }
+
     else if (verb == "list") {
         Log("\n=== Scene List ===\n");
         Log("  Prologue:\n");
@@ -2140,6 +3508,36 @@ static bool InstallHooks(HMODULE hResident) {
         }
     }
 
+    // Hook RetouchSystem::cmdMessage() -- captures the command index into
+    // t_cmdIndex so AdvCharSay_Hook can key its lookup on (file, index)
+    // instead of on the message text. Must be installed for position-keyed
+    // translation to work; without it every lookup falls back to text-keyed.
+    {
+        uintptr_t addr = base + Offsets::CmdMessage;
+        Log("[*] Trying to hook RetouchSystem::cmdMessage() at 0x%p\n", (void*)addr);
+        if (MH_CreateHook((void*)addr, (void*)&CmdMessage_Hook, (void**)&g_origCmdMessage) == MH_OK) {
+            MH_EnableHook((void*)addr);
+            Log("[+] RetouchSystem::cmdMessage() hooked - position-keyed lookup active\n");
+        }
+        else {
+            Log("[!] cmdMessage hook FAILED - falling back to text-keyed lookup\n");
+        }
+    }
+
+    // Hook printSub -- supplies the print cursor for message text.
+    {
+        uintptr_t addr = base + Offsets::PrintSub;
+        Log("[*] Trying to hook RetouchPrintManager::printSub() at 0x%p\n", (void*)addr);
+        if (MH_CreateHook((void*)addr, (void*)&PrintSub_Hook,
+                          (void**)&g_origPrintSub) == MH_OK) {
+            MH_EnableHook((void*)addr);
+            Log("[+] Glyph loop entry hooked\n");
+        }
+        else {
+            Log("[!] printSub hook FAILED - restored characters will not render\n");
+        }
+    }
+
     // Hook RetouchPrintManager::printEx()
     {
         uintptr_t addr = base + Offsets::PrintEx;
@@ -2147,6 +3545,21 @@ static bool InstallHooks(HMODULE hResident) {
         if (MH_CreateHook((void*)addr, (void*)&PrintEx_Hook, (void**)&g_origPrintEx) == MH_OK) {
             MH_EnableHook((void*)addr);
             Log("[+] RetouchPrintManager::printEx() hooked\n");
+        }
+    }
+
+    // Hook RetouchPrintManager::drawHistory() -- marks backlog repaints so they
+    // do not inherit the live line's command index. Without it, rewinding shows
+    // the current message for every entry.
+    {
+        uintptr_t addr = base + Offsets::DrawHistory;
+        Log("[*] Trying to hook RetouchPrintManager::drawHistory() at 0x%p\n", (void*)addr);
+        if (MH_CreateHook((void*)addr, (void*)&DrawHistory_Hook, (void**)&g_origDrawHistory) == MH_OK) {
+            MH_EnableHook((void*)addr);
+            Log("[+] RetouchPrintManager::drawHistory() hooked - backlog isolated\n");
+        }
+        else {
+            Log("[!] drawHistory hook FAILED - backlog may repeat the current line\n");
         }
     }
 
@@ -2182,16 +3595,6 @@ static bool InstallHooks(HMODULE hResident) {
         }
     }
 
-    // Hook internal codepage getter
-    {
-        uintptr_t addr = base + Offsets::GetCodePage;
-        Log("[*] Hooking codepage getter at 0x%p\n", (void*)addr);
-        if (MH_CreateHook((void*)addr, (void*)&GetCodePage_Hook, (void**)&g_origGetCodePage) == MH_OK) {
-            MH_EnableHook((void*)addr);
-            Log("[+] Codepage getter hooked -> 932 (Japanese)\n");
-        }
-    }
-
     // Get liteSetDebugMode function pointer
     g_liteSetDebugMode = (Fn_LiteSetDebugMode)(base + Offsets::LiteSetDebugMode);
     Log("[+] liteSetDebugMode at 0x%p\n", (void*)g_liteSetDebugMode);
@@ -2216,16 +3619,21 @@ static BOOL CALLBACK TranslateDialogChildProc(HWND hwnd, LPARAM lParam) {
     wchar_t wideText[256];
     if (GetWindowTextW(hwnd, wideText, 256) > 0 && wideText[0]) {
         // Convert Unicode to SJIS for lookup (dialog resources are SJIS-encoded)
-        char sjisText[256];
-        WideCharToMultiByte(932, 0, wideText, -1, sjisText, sizeof(sjisText), nullptr, nullptr);
-        
+        char sjisText[512];
+        if (WideCharToMultiByte(932, 0, wideText, -1, sjisText, sizeof(sjisText),
+                                nullptr, nullptr) == 0) {
+            return TRUE;  // didn't fit or unconvertible -- leave this control alone
+        }
+
         // Try to find translation
-        const std::string* translation = g_translationDB.FindUITranslation(sjisText);
-        if (translation) {
+        std::string translation = g_translationDB.FindUITranslation(sjisText);
+        if (!translation.empty()) {
             // Convert UTF-8 translation to Unicode and set
             wchar_t translatedText[256];
-            MultiByteToWideChar(CP_UTF8, 0, translation->c_str(), -1, translatedText, 256);
-            SetWindowTextW(hwnd, translatedText);
+            if (MultiByteToWideChar(CP_UTF8, 0, translation.c_str(), -1,
+                                    translatedText, 256) > 0) {
+                SetWindowTextW(hwnd, translatedText);
+            }
         }
     }
     return TRUE; // Continue enumeration
@@ -2235,10 +3643,13 @@ static INT_PTR WINAPI DialogBoxParamA_Hook(
     HINSTANCE hInstance, LPCSTR lpTemplateName, HWND hWndParent,
     DLGPROC lpDialogFunc, LPARAM dwInitParam)
 {
-    // Install a temporary CBT hook to translate dialog
-    static HHOOK s_cbtHook = nullptr;
-    static std::string s_pendingTitle; // Store translated title for later
-    
+    // Install a temporary CBT hook to translate the dialog. These are
+    // thread_local because the WH_CBT hook is per-thread (installed with
+    // GetCurrentThreadId) and two threads must not share this state; the lambda
+    // stays captureless so it still converts to a HOOKPROC.
+    thread_local HHOOK s_cbtHook = nullptr;
+    thread_local std::string s_pendingTitle;
+
     auto cbtProc = [](int nCode, WPARAM wParam, LPARAM lParam) -> LRESULT {
         if (nCode == HCBT_CREATEWND) {
             // Window is being created - we can access CREATESTRUCT
@@ -2252,12 +3663,13 @@ static INT_PTR WINAPI DialogBoxParamA_Hook(
                     // Only process if it looks like a string (not a resource ID)
                     if ((uintptr_t)wideName > 0xFFFF && wideName[0]) {
                         // Convert Unicode to SJIS for lookup
-                        char sjisName[256];
-                        WideCharToMultiByte(932, 0, wideName, -1, sjisName, sizeof(sjisName), nullptr, nullptr);
-                        
-                        const std::string* translation = g_translationDB.FindUITranslation(sjisName);
-                        if (translation) {
-                            s_pendingTitle = *translation;
+                        char sjisName[512];
+                        if (WideCharToMultiByte(932, 0, wideName, -1, sjisName,
+                                                sizeof(sjisName), nullptr, nullptr) > 0) {
+                            std::string translation = g_translationDB.FindUITranslation(sjisName);
+                            if (!translation.empty()) {
+                                s_pendingTitle = translation;
+                            }
                         }
                     }
                 }
@@ -2293,6 +3705,40 @@ static INT_PTR WINAPI DialogBoxParamA_Hook(
     return result;
 }
 
+// Translate if we can, then widen: UTF-8 straight from the TSV on a hit, CP932
+// on a miss. Returns false when there is nothing to show.
+static bool UiTextToWide(LPCSTR sjis, std::wstring& out) {
+    if (!sjis || !*sjis) return false;
+
+    std::string tl = g_translationDB.FindUITranslation(sjis);
+    UINT cp         = tl.empty() ? 932u : CP_UTF8;
+    const char* src = tl.empty() ? sjis : tl.c_str();
+
+    // Explicit codepages, so MultiByteToWideChar_Hook passes them through.
+    int n = MultiByteToWideChar(cp, 0, src, -1, nullptr, 0);
+    if (n <= 0) return false;
+    out.resize(n);
+    MultiByteToWideChar(cp, 0, src, -1, &out[0], n);
+    if (!out.empty() && out.back() == L'\0') out.pop_back();
+    return true;
+}
+
+// Startup/environment errors bypass DialogBoxParamA and call MessageBoxA.
+// Widen here and call W: MessageBoxA converts through the process ACP in
+// ntdll's NLS tables, which neither the MultiByteToWideChar nor the GetACP
+// hook reaches -- SJIS bytes would be read as CP1252 on a Western system.
+typedef int(WINAPI* Fn_MessageBoxA)(HWND, LPCSTR, LPCSTR, UINT);
+static Fn_MessageBoxA g_origMessageBoxA = nullptr;
+
+static int WINAPI MessageBoxA_Hook(HWND hWnd, LPCSTR lpText, LPCSTR lpCaption, UINT uType) {
+    std::wstring wText, wCaption;
+    bool haveText    = UiTextToWide(lpText, wText);
+    bool haveCaption = UiTextToWide(lpCaption, wCaption);
+    return MessageBoxW(hWnd,
+                       haveText    ? wText.c_str()    : nullptr,
+                       haveCaption ? wCaption.c_str() : nullptr,
+                       uType);
+}
 
 static HMODULE WINAPI LoadLibraryExA_Hook(LPCSTR lpLibFileName, HANDLE hFile, DWORD dwFlags) {
     HMODULE result = g_origLoadLibraryExA(lpLibFileName, hFile, dwFlags);
@@ -2331,57 +3777,64 @@ static int WINAPI WideCharToMultiByte_Hook(UINT, DWORD, LPCWCH, int, LPSTR, int,
 static HWND WINAPI CreateWindowExA_Hook(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
 static BOOL WINAPI SetWindowTextA_Hook(HWND, LPCSTR);
 
+static HWND g_mainGameWindow = nullptr;
+
+static BOOL CALLBACK FixEarlyWindowProc(HWND hwnd, LPARAM) {
+    if (!Config::windowTitle[0]) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId()) return TRUE;
+    wchar_t w[256];
+    if (MultiByteToWideChar(CP_UTF8, 0, Config::windowTitle, -1, w, 256) > 0) {
+        DefWindowProcW(hwnd, WM_SETTEXT, 0, (LPARAM)w);
+        if (!g_mainGameWindow && !GetParent(hwnd)) g_mainGameWindow = hwnd;
+    }
+    return TRUE;
+}
+
+
+// Hooks a codepage API in whichever module actually implements it.
+// On Win7+ kernel32 forwards to kernelbase, so hooking kernelbase catches calls that
+// bypass the forwarder; pre-Win7 there is no kernelbase at all.
+static bool HookLocaleApi(const char* name, void* detour, void** original) {
+    static const wchar_t* kModules[] = { L"kernelbase", L"kernel32" };
+
+    for (const wchar_t* module : kModules) {
+        if (MH_CreateHookApi(module, name, detour, original) == MH_OK) {
+            Log("[LOCALE] %s hooked in %S (locale codepages -> CP932)\n", name, module);
+            return true;
+        }
+    }
+    return false;
+}
+
 //=============================================================================
 // Initialization
 //=============================================================================
 static bool Initialize() {
     // Load config FIRST (before console init, so we know if console is enabled)
     LoadConfig();
+    InitDiskLog();
 
-    if (Config::enableConsole) {
-        InitConsole();
-
-        // Enable console input
-        FILE* stdinFile;
-        freopen_s(&stdinFile, "CONIN$", "r", stdin);
-
-        // Start input thread
-        CreateThread(nullptr, 0, ConsoleInputThread, nullptr, 0, nullptr);
-    }
-
-    const char* base_title = Config::windowTitle[0] ? Config::windowTitle : "よついろ★パッショナート！";
-
-    Log("==================================================\n");
-    Log("%s - Translation Hook\n", base_title);
-    Log("==================================================\n\n");
-
-    // Load DiscordRPC
-    if (Config::enableDiscordPresence) {
-        InitDiscordRPC();
-        Log("[Discord] Rich Presence enabled (can disable in ini: EnableDiscordPresence=false)\n");
-    } else {
-        Log("[Discord] Rich Presence disabled in config\n");
-    }
-
-    // Load translations using config paths
-    g_translationDB.Load(Config::translationFile, Config::namesFile);
-    LoadCharIdTable(Config::charIdFile);
+    // what are we on
+    Log("[LOCALE] system ACP=%u\n", GetACP());
 
     if (MH_Initialize() != MH_OK) {
-        Log("[!] MinHook init failed\n");
+        MessageBoxA(nullptr, "MinHook initialization failed.\nTranslation hook is disabled.",
+                    "Translation Hook", MB_ICONERROR | MB_OK);
         return false;
     }
 
-    //=========================================================================
-    // Locale/Codepage Hooks - Fix Japanese window titles on non-JP systems
-    //=========================================================================
-    if (MH_CreateHookApi(L"kernelbase", "MultiByteToWideChar",
-        (void*)&MultiByteToWideChar_Hook, (void**)&g_origMultiByteToWideChar) == MH_OK) {
-        Log("[LOCALE] MultiByteToWideChar hooked (CP_ACP -> CP932)\n");
+    // --- hooks ---
+    if (!HookLocaleApi("MultiByteToWideChar",
+                       (void*)&MultiByteToWideChar_Hook,
+                       (void**)&g_origMultiByteToWideChar)) {
+        Log("[!] LOCALE: MultiByteToWideChar hook failed - Japanese text will be mangled\n");
     }
-    if (MH_CreateHookApi(L"kernelbase", "WideCharToMultiByte",
-        (void*)&WideCharToMultiByte_Hook, (void**)&g_origWideCharToMultiByte) == MH_OK) {
-        Log("[LOCALE] WideCharToMultiByte hooked (CP_ACP -> CP932)\n");
+    if (!HookLocaleApi("WideCharToMultiByte",
+                       (void*)&WideCharToMultiByte_Hook,
+                       (void**)&g_origWideCharToMultiByte)) {
+        Log("[!] LOCALE: WideCharToMultiByte hook failed - Japanese text will be mangled\n");
     }
     if (MH_CreateHookApi(L"user32", "CreateWindowExA",
         (void*)&CreateWindowExA_Hook, (void**)&g_origCreateWindowExA) == MH_OK) {
@@ -2395,95 +3848,117 @@ static bool Initialize() {
         (void*)&DialogBoxParamA_Hook, (void**)&g_origDialogBoxParamA) == MH_OK) {
         Log("[DIALOG] DialogBoxParamA hooked (for UI translation)\n");
     }
-
-    // Hook GetACP/GetOEMCP
+    if (MH_CreateHookApi(L"user32", "MessageBoxA",
+        (void*)&MessageBoxA_Hook, (void**)&g_origMessageBoxA) == MH_OK) {
+        Log("[DIALOG] MessageBoxA hooked (startup/error dialogs)\n");
+    }
     if (MH_CreateHookApi(L"kernel32", "GetACP",
         (void*)&GetACP_Hook, (void**)&g_origGetACP) == MH_OK) {
         Log("[LOCALE] GetACP hooked -> 932 (Japanese)\n");
     }
-
     if (MH_CreateHookApi(L"kernel32", "GetOEMCP",
         (void*)&GetOEMCP_Hook, (void**)&g_origGetOEMCP) == MH_OK) {
         Log("[LOCALE] GetOEMCP hooked -> 932 (Japanese)\n");
     }
-
-    // Hook CharPrevA/CharNextA
     if (MH_CreateHookApi(L"user32", "CharPrevA",
         (void*)&CharPrevA_Hook, (void**)&g_origCharPrevA) == MH_OK) {
         Log("[LOCALE] CharPrevA hooked -> SJIS\n");
     }
-
     if (MH_CreateHookApi(L"user32", "CharNextA",
         (void*)&CharNextA_Hook, (void**)&g_origCharNextA) == MH_OK) {
         Log("[LOCALE] CharNextA hooked -> SJIS\n");
     }
-
-    // Hook OutputDebugStringA to capture game debug output
     if (MH_CreateHookApi(L"kernel32", "OutputDebugStringA",
         (void*)&OutputDebugStringA_Hook, (void**)&g_origOutputDebugStringA) == MH_OK) {
         Log("[+] OutputDebugStringA hooked - game debug -> console\n");
     }
-
-    // Hook GetGlyphOutlineA
     if (MH_CreateHookApi(L"gdi32", "GetGlyphOutlineA",
         (void*)&GetGlyphOutlineA_Hook, (void**)&g_origGetGlyphOutlineA) == MH_OK) {
         Log("[+] GetGlyphOutlineA hooked\n");
     }
-
-    // Hook CreateFontIndirect
+    if (MH_CreateHookApi(L"gdi32", "GetTextExtentPoint32A",
+        (void*)&GetTextExtentPoint32A_Hook,
+        (void**)&g_origGetTextExtentPoint32A) == MH_OK) {
+        Log("[+] GetTextExtentPoint32A hooked - textOut fragment boundaries\n");
+    }
+    else {
+        Log("[!] GetTextExtentPoint32A hook failed - backlog/save-title"
+            " restoration will fall back to best-fit spelling\n");
+    }
+    if (MH_CreateHookApi(L"gdi32", "GetOutlineTextMetricsA",
+        (void*)&GetOutlineTextMetricsA_Hook,
+        (void**)&g_origGetOutlineTextMetricsA) == MH_OK) {
+        Log("[+] GetOutlineTextMetricsA hooked - glyph loop / textOut split\n");
+    }
     if (MH_CreateHookApi(L"gdi32", "CreateFontIndirectA",
         (void*)&CreateFontIndirectA_Hook,
         (void**)&g_origCreateFontIndirectA) == MH_OK) {
         Log("[+] Font hook installed\n");
     }
-
-    // Hook CreateFileA for asset redirection
     if (Config::enableAssetRedirect) {
-        // Create assets directory if needed
         CreateDirectoryA(".\\tl", nullptr);
         CreateDirectoryA(Config::tlAssetsPath, nullptr);
-
         if (MH_CreateHookApi(L"kernel32", "CreateFileA",
             (void*)&CreateFileA_Hook, (void**)&g_origCreateFileA) == MH_OK) {
             Log("[+] Asset redirection hooked (%s)\n", Config::tlAssetsPath);
         }
     }
 
-    // Enable all API hooks at once
+    HMODULE hResident = GetModuleHandleA("resident.dll");
+    if (hResident) {
+        InstallHooks(hResident);
+    } else if (MH_CreateHookApi(L"kernel32", "LoadLibraryExA",
+        (void*)&LoadLibraryExA_Hook, (void**)&g_origLoadLibraryExA) == MH_OK) {
+        Log("[*] Waiting for resident.dll...\n");
+    }
+
+    // ok hooks
     MH_EnableHook(MH_ALL_HOOKS);
 
-    // Start file watcher
-    std::string watchDir = ".\\tl"; // Default
+    // fix win
+    EnumWindows(FixEarlyWindowProc, 0);
+
+    InitConsole();
+    if (Config::enableConsole) {
+        FILE* stdinFile;
+        freopen_s(&stdinFile, "CONIN$", "r", stdin);
+        CreateThread(nullptr, 0, ConsoleInputThread, nullptr, 0, nullptr);
+    }
+
+    const char* base_title = Config::windowTitle[0] ? Config::windowTitle : "よついろ★パッショナート！";
+    Log("==================================================\n");
+    Log("%s - Translation Hook\n", base_title);
+    Log("==================================================\n\n");
+
+    if (Config::enableDiscordPresence) {
+        InitDiscordRPC();
+        Log("[Discord] Rich Presence enabled (can disable in ini: EnableDiscordPresence=false)\n");
+    } else {
+        Log("[Discord] Rich Presence disabled in config\n");
+    }
+
+    // Load translations using config paths
+    g_translationDB.Load(Config::translationFile, Config::namesFile);
+    LoadCharIdTable(Config::charIdFile);
+
+    std::string watchDir = ".\\tl";
     std::string transFile = Config::translationFile;
     size_t lastSlash = transFile.find_last_of("\\/");
     if (lastSlash != std::string::npos) {
         watchDir = transFile.substr(0, lastSlash);
     }
-
-    g_fileWatcher.Start(watchDir.c_str(), { 
-        AssetRedirect::GetFileName(Config::translationFile), 
-        AssetRedirect::GetFileName(Config::namesFile) 
+    g_fileWatcher.Start(watchDir.c_str(), {
+        AssetRedirect::GetFileName(Config::translationFile),
+        AssetRedirect::GetFileName(Config::namesFile),
+        AssetRedirect::GetFileName(Config::uiFile)
     }, []() {
         g_translationDB.Reload();
         MessageBeep(MB_OK);
     });
 
-    // Start hotkey thread
     g_hotkeyThread = CreateThread(nullptr, 0, HotkeyThreadProc, nullptr, 0, nullptr);
 
-    HMODULE hResident = GetModuleHandleA("resident.dll");
-    if (hResident) {
-        return InstallHooks(hResident);
-    }
-
-    if (MH_CreateHookApi(L"kernel32", "LoadLibraryExA",
-        (void*)&LoadLibraryExA_Hook, (void**)&g_origLoadLibraryExA) == MH_OK) {
-        MH_EnableHook((void*)&LoadLibraryExA);
-        Log("[*] Waiting for resident.dll...\n");
-        return true;
-    }
-
-    return false;
+    return true;
 }
 
 static void Shutdown() {
@@ -2501,22 +3976,39 @@ static void Shutdown() {
 
     Log("\n[*] Shutting down...\n");
     MH_Uninitialize();
+    WordWrap::ReleaseMeasureDC();
+    JpFallback::Release();
 
     if (g_logFile) {
         fclose(g_logFile);
         FreeConsole();
+    }
+
+    if (g_diskLog) {
+        std::lock_guard<std::mutex> lock(g_logMutex);
+        fclose(g_diskLog);
+        g_diskLog = nullptr;
     }
 }
 
 //=============================================================================
 // Codepage Hook Functions
 //=============================================================================
+
+// CP_ACP(0), CP_OEMCP(1), CP_MACCP(2) and CP_THREAD_ACP(3) all resolve against
+// the current locale instead of naming a codepage outright.
+static inline bool IsLocaleRelativeCodePage(UINT cp) {
+    return cp == CP_ACP || cp == CP_OEMCP || cp == CP_MACCP || cp == CP_THREAD_ACP;
+}
+
 static int WINAPI MultiByteToWideChar_Hook(
     UINT CodePage, DWORD dwFlags, LPCCH lpMultiByteStr, int cbMultiByte,
     LPWSTR lpWideCharStr, int cchWideChar)
 {
-    // Force CP_ACP/CP_OEMCP to Japanese
-    if (CodePage == CP_ACP || CodePage == CP_OEMCP) {
+    // Force every locale-relative codepage to Japanese. ATL's conversion
+    // helpers pass CP_THREAD_ACP, which resolves against the thread locale
+    // rather than GetACP, so it needs redirecting too.
+    if (IsLocaleRelativeCodePage(CodePage)) {
         CodePage = 932;
     }
     return g_origMultiByteToWideChar(CodePage, dwFlags, lpMultiByteStr, cbMultiByte,
@@ -2527,7 +4019,7 @@ static int WINAPI WideCharToMultiByte_Hook(
     UINT CodePage, DWORD dwFlags, LPCWCH lpWideCharStr, int cchWideChar,
     LPSTR lpMultiByteStr, int cbMultiByte, LPCCH lpDefaultChar, LPBOOL lpUsedDefaultChar)
 {
-    if (CodePage == CP_ACP || CodePage == CP_OEMCP) {
+    if (IsLocaleRelativeCodePage(CodePage)) {
         CodePage = 932;
     }
     return g_origWideCharToMultiByte(CodePage, dwFlags, lpWideCharStr, cchWideChar,
@@ -2537,8 +4029,6 @@ static int WINAPI WideCharToMultiByte_Hook(
 //=============================================================================
 // CreateWindowExA Hook - Create windows with Unicode title
 //=============================================================================
-static HWND g_mainGameWindow = nullptr;
-
 static HWND WINAPI CreateWindowExA_Hook(
     DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle,
     int x, int y, int nWidth, int nHeight,
@@ -2571,10 +4061,10 @@ static HWND WINAPI CreateWindowExA_Hook(
     } 
     else if (lpWindowName && lpWindowName[0]) {
         // Try to find UI translation (for dialogs, buttons, etc.)
-        const std::string* uiTranslation = g_translationDB.FindUITranslation(lpWindowName);
-        if (uiTranslation) {
+        std::string uiTranslation = g_translationDB.FindUITranslation(lpWindowName);
+        if (!uiTranslation.empty()) {
             // Found translation - convert UTF-8 to Unicode
-            MultiByteToWideChar(CP_UTF8, 0, uiTranslation->c_str(), -1, wideTitle, 512);
+            MultiByteToWideChar(CP_UTF8, 0, uiTranslation.c_str(), -1, wideTitle, 512);
         } else {
             // No translation - just convert SJIS to Unicode
             g_origMultiByteToWideChar(932, 0, lpWindowName, -1, wideTitle, 512);
@@ -2615,11 +4105,11 @@ static BOOL WINAPI SetWindowTextA_Hook(HWND hWnd, LPCSTR lpString)
     }
 
     if (lpString) {
-        int wlen = g_origMultiByteToWideChar(932, 0, lpString, -1, nullptr, 0);
-        if (wlen > 0 && wlen <= 4096) {
-            wchar_t wstr[4096];
-            g_origMultiByteToWideChar(932, 0, lpString, -1, wstr, wlen);
-            DefWindowProcW(hWnd, WM_SETTEXT, 0, (LPARAM)wstr);
+        // Dialog captions arrive here from WM_INITDIALOG (0x417E80). They are
+        // not children, so the DialogBoxParamA CBT pass never sees them.
+        std::wstring wide;
+        if (UiTextToWide(lpString, wide)) {
+            DefWindowProcW(hWnd, WM_SETTEXT, 0, (LPARAM)wide.c_str());
             return TRUE;
         }
     }
@@ -2636,11 +4126,16 @@ static DWORD WINAPI DeferredInit(LPVOID) {
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
     switch (reason) {
-    case DLL_PROCESS_ATTACH:
+    case DLL_PROCESS_ATTACH: {
         DisableThreadLibraryCalls(hModule);
-        proxy_init();
+        wchar_t path[MAX_PATH];
+        GetModuleFileNameW(hModule, path, MAX_PATH);
+        const wchar_t* name = wcsrchr(path, L'\\');
+        name = name ? name + 1 : path;
+        if (_wcsicmp(name, L"winmm.dll") == 0) proxy_init();  // only proxy when we ARE winmm.dll
         CreateThread(nullptr, 0, DeferredInit, nullptr, 0, nullptr);
         break;
+    }
 
     case DLL_PROCESS_DETACH:
         if (!lpReserved) {
