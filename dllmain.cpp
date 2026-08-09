@@ -1,4 +1,4 @@
-﻿#define WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <cstdio>
 #include <cstdint>
@@ -151,12 +151,12 @@ namespace Config {
     int logToggleHotkey = VK_F7;
 
     // Font
+    // Custom font folder, loaded private to this process
+    char fontDir[MAX_PATH] = ".\\tl\\fonts\\";
     char fontName[64] = "";
     char fontNameProportional[64] = "";
     // Used for Japanese glyphs when the custom face has no Shift-JIS charset
     char fontFallbackJp[64] = "";
-    // Custom font folder, loaded private to this process
-    char fontDir[MAX_PATH] = ".\\tl\\fonts\\";
 
     // Asset redirection
     bool enableAssetRedirect = true;
@@ -228,6 +228,9 @@ static void SaveDefaultConfig() {
     fprintf(f, "\n");
 
     fprintf(f, "[Font]\n");
+    fprintf(f, "; Custom font folder (empty=disable)\n");
+    fprintf(f, "Dir=.\\tl\\fonts\\\n");
+    fprintf(f, "\n");
     fprintf(f, "; Custom font name (empty=game default)\n");
     fprintf(f, "Name=\n");
     fprintf(f, "\n");
@@ -237,9 +240,6 @@ static void SaveDefaultConfig() {
     fprintf(f, "; Japanese glyphs when the font above is Latin-only\n");
     fprintf(f, "; (untranslated lines, unmapped names). Empty=MS Gothic\n");
     fprintf(f, "FallbackJapanese=\n");
-    fprintf(f, "\n");
-    fprintf(f, "; Custom font folder (empty=disable)\n");
-    fprintf(f, "Dir=.\\tl\\fonts\\\n");
     fprintf(f, "\n");
 
     fprintf(f, "[Files]\n");
@@ -390,10 +390,10 @@ static void LoadConfig() {
     Config::logToggleHotkey = ReadIntEnsure("Hotkeys", "LogToggleKey", VK_F7);
 
     // Font
+    ReadStringEnsure("Font", "Dir", ".\\tl\\fonts\\", Config::fontDir, sizeof(Config::fontDir));
     ReadStringEnsure("Font", "Name", "", Config::fontName, sizeof(Config::fontName));
     ReadStringEnsure("Font", "NameProportional", "", Config::fontNameProportional, sizeof(Config::fontNameProportional));
     ReadStringEnsure("Font", "FallbackJapanese", "", Config::fontFallbackJp, sizeof(Config::fontFallbackJp));
-    ReadStringEnsure("Font", "Dir", ".\\tl\\fonts\\", Config::fontDir, sizeof(Config::fontDir));
 
     // Files
     ReadStringEnsure("Files", "TranslationFile", Config::kDefaultTranslationFile, Config::translationFile, sizeof(Config::translationFile));
