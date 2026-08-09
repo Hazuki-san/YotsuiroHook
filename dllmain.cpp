@@ -183,6 +183,11 @@ namespace Config {
     bool enableGameDebugOutput = false;
 }
 
+// Set at the end of LoadConfig. CreateWindowExA_Hook runs on the loader thread,
+// before the deferred thread has filled the Config buffers, and needs a way to
+// tell that state apart from a config that has loaded with no WindowTitle set.
+static std::atomic<bool> g_configLoaded{ false };
+
 //=============================================================================
 // Config Save/Load
 //=============================================================================
@@ -450,6 +455,7 @@ static void LoadConfig() {
     if (Config::fontName[0] != '\0') {
         Log("[CONFIG] Font: %s\n", Config::fontName);
     }
+    g_configLoaded.store(true, std::memory_order_release);
 }
 
 //=============================================================================
@@ -4488,6 +4494,43 @@ static int WINAPI WideCharToMultiByte_Hook(UINT, DWORD, LPCWCH, int, LPSTR, int,
 static HWND WINAPI CreateWindowExA_Hook(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
 static BOOL WINAPI SetWindowTextA_Hook(HWND, LPCSTR);
 
+// WinMain looks for an already-running copy with FindWindowA(class, title) and
+// raises that window instead of starting a second one. The caption holds UTF-16
+// once CreateWindowExA_Hook has replaced it, and FindWindowA converts its own
+// title argument with the system code page, so under a non-932 ANSI code page
+// the comparison can no longer match. The instance that runs this search takes
+// the branch that never creates a window, so the hook has to install with the
+// early set.
+//
+// The original runs first, so this can only turn a failed search into a
+// successful one. The high-byte test keeps the retry to titles that could have
+// been Shift-JIS, which leaves the engine's searches for its editor tools
+// (retouchEditor and lanoveeEd, both ASCII) on the original path.
+typedef HWND(WINAPI* Fn_FindWindowA)(LPCSTR, LPCSTR);
+static Fn_FindWindowA g_origFindWindowA = nullptr;
+
+static HWND WINAPI FindWindowA_Hook(LPCSTR lpClassName, LPCSTR lpWindowName) {
+    HWND hwnd = g_origFindWindowA(lpClassName, lpWindowName);
+    if (hwnd || !lpWindowName) return hwnd;
+
+    bool couldBeOurs = false;
+    for (const unsigned char* p = (const unsigned char*)lpWindowName; *p; ++p) {
+        if (*p >= 0x80) { couldBeOurs = true; break; }
+    }
+    if (!couldBeOurs) return hwnd;
+
+    wchar_t wideClass[256], wideName[512];
+    LPCWSTR pClass = nullptr;
+    if (lpClassName) {
+        // A value this small is an atom, not a pointer; pass it through.
+        if ((uintptr_t)lpClassName <= 0xFFFF) pClass = (LPCWSTR)lpClassName;
+        else if (MultiByteToWideChar(932, 0, lpClassName, -1, wideClass, 256) > 0) pClass = wideClass;
+        else return hwnd;
+    }
+    if (MultiByteToWideChar(932, 0, lpWindowName, -1, wideName, 512) <= 0) return hwnd;
+    return FindWindowW(pClass, wideName);
+}
+
 // Used only by the title hooks. GameHasFocus intentionally does not use it;
 // it checks the foreground window's process instead.
 static std::atomic<HWND> g_mainGameWindow{ nullptr };
@@ -4510,6 +4553,13 @@ static BOOL CALLBACK FixEarlyWindowProc(HWND hwnd, LPARAM) {
 // On Win7+ kernel32 forwards to kernelbase, so hooking kernelbase catches calls that
 // bypass the forwarder; pre-Win7 there is no kernelbase at all.
 static bool HookLocaleApi(const char* name, void* detour, void** original) {
+    // Stop if this API is already hooked. On a second call the kernelbase
+    // attempt returns MH_ERROR_ALREADY_CREATED, the loop falls through to
+    // kernel32, that create succeeds, and `original` ends up pointing at the
+    // kernel32 trampoline while the kernelbase patch is still live. The two
+    // patches then call each other, and the next conversion recurses until the
+    // stack runs out.
+    if (*original) return true;
     static const wchar_t* kModules[] = { L"kernelbase", L"kernel32" };
 
     for (const wchar_t* module : kModules) {
@@ -4546,6 +4596,79 @@ static std::wstring AnsiPathToWide(const char* s) {
     return out;
 }
 
+// Creating a hook and enabling it fail independently, and MinHook writes
+// `original` only when the create succeeds, so the trampoline pointer cannot
+// tell an enabled hook from one that exists but is disabled. Keeping the target
+// address lets a later call enable a hook that an earlier one only created,
+// rather than reporting success for a hook that is intercepting nothing.
+struct EarlyHook { void* target = nullptr; bool enabled = false; };
+static EarlyHook g_hookCreateWindowExA;
+static EarlyHook g_hookSetWindowTextA;
+static EarlyHook g_hookFindWindowA;
+static std::atomic<bool> g_windowHooksArmed{ false };
+static std::atomic<int>  g_earlyHookStatus{ 0 };   // 0 not attempted, 1 armed, 2 failed
+
+static bool EnsureHook(EarlyHook& hook, const wchar_t* module, const char* name,
+                       void* detour, void** original) {
+    if (hook.enabled) return true;
+    if (!hook.target &&
+        MH_CreateHookApiEx(module, name, detour, original, &hook.target) != MH_OK) {
+        return false;
+    }
+    MH_STATUS st = MH_EnableHook(hook.target);
+    // MH_ERROR_ENABLED means an earlier call got there first, which is success.
+    hook.enabled = (st == MH_OK || st == MH_ERROR_ENABLED);
+    return hook.enabled;
+}
+
+// Installs the hooks that have to be live before the game's entry point runs.
+// WinMain reads the Shift-JIS class name and title out of ExHIBIT.ini, then
+// takes one of two paths: it registers the window class and creates the main
+// window, or, when another copy already holds the instance event, it looks for
+// that copy's window and exits. Both run before the deferred thread has armed
+// anything, and nothing on that thread corrects the caption afterwards, because
+// FixEarlyWindowProc only acts when WindowTitle is set. Only these three hooks
+// belong here; the rest stay on the deferred thread, away from the loader lock.
+//
+// MinHook is safe to call from the loader thread for a statically imported DLL:
+// it never calls LoadLibrary, it resolves each target from a module the loader
+// has already mapped, and it holds no lock that a thread frozen by
+// MH_EnableHook could own. DllMain calls this only on the static path; see the
+// call site there for why that matters.
+//
+// Log() cannot record anything from here: the disk log is not open yet, and the
+// buffer Log() writes to beforehand is discarded when both the console and the
+// log file are disabled. Initialize() reports g_earlyHookStatus once the log
+// exists.
+//
+// The two callers never overlap, because DllMain returns before the deferred
+// thread starts, so the EarlyHook fields need no lock.
+static void EnsureWindowHooksInstalled() {
+    if (g_windowHooksArmed.load(std::memory_order_acquire)) return;
+
+    MH_STATUS init = MH_Initialize();
+    if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) {
+        g_earlyHookStatus.store(2, std::memory_order_release);
+        OutputDebugStringA("[YotsuiroHook] MinHook init failed; window hooks unavailable\n");
+        return;
+    }
+
+    bool all = true;
+    all &= EnsureHook(g_hookCreateWindowExA, L"user32", "CreateWindowExA",
+                      (void*)&CreateWindowExA_Hook, (void**)&g_origCreateWindowExA);
+    all &= EnsureHook(g_hookSetWindowTextA, L"user32", "SetWindowTextA",
+                      (void*)&SetWindowTextA_Hook, (void**)&g_origSetWindowTextA);
+    all &= EnsureHook(g_hookFindWindowA, L"user32", "FindWindowA",
+                      (void*)&FindWindowA_Hook, (void**)&g_origFindWindowA);
+
+    if (all) g_windowHooksArmed.store(true, std::memory_order_release);
+    g_earlyHookStatus.store(all ? 1 : 2, std::memory_order_release);
+
+    OutputDebugStringA(all
+        ? "[YotsuiroHook] window hooks armed\n"
+        : "[YotsuiroHook] window hooks incomplete; the title may be mangled\n");
+}
+
 //=============================================================================
 // Initialization
 //=============================================================================
@@ -4553,6 +4676,15 @@ static bool Initialize() {
     // Load config FIRST (before console init, so we know if console is enabled)
     LoadConfig();
     InitDiskLog();
+
+    // Read before the install below, so this reports the state at load rather
+    // than after it.
+    switch (g_earlyHookStatus.load(std::memory_order_acquire)) {
+    case 1: Log("[LOCALE] window hooks armed before WinMain\n"); break;
+    case 2: Log("[!] LOCALE: window hooks failed to arm before WinMain -"
+                " the title will be mangled on non-Japanese systems\n"); break;
+    default: Log("[LOCALE] window hooks not armed at load (dynamic load)\n"); break;
+    }
 
     if (g_modulePinFailed.load()) {
         Log("[!] Module pin failed at load; unloading this DLL would be unsafe."
@@ -4566,7 +4698,14 @@ static bool Initialize() {
     // Call this before the first probe. FontProbe caches each face name.
     LoadBundledFonts();
 
-    if (MH_Initialize() != MH_OK) {
+    // On a static import DllMain has armed these already, so this returns at
+    // once unless a hook was created but not enabled, which it then retries.
+    // This call is what installs them on a dynamic load, where DllMain skips
+    // the loader-thread path.
+    EnsureWindowHooksInstalled();
+
+    MH_STATUS init = MH_Initialize();
+    if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) {
         MessageBoxA(nullptr, "MinHook initialization failed.\nTranslation hook is disabled.",
                     "Translation Hook", MB_ICONERROR | MB_OK);
         return false;
@@ -4582,14 +4721,6 @@ static bool Initialize() {
                        (void*)&WideCharToMultiByte_Hook,
                        (void**)&g_origWideCharToMultiByte)) {
         Log("[!] LOCALE: WideCharToMultiByte hook failed - Japanese text will be mangled\n");
-    }
-    if (MH_CreateHookApi(L"user32", "CreateWindowExA",
-        (void*)&CreateWindowExA_Hook, (void**)&g_origCreateWindowExA) == MH_OK) {
-        Log("[LOCALE] CreateWindowExA hooked (-> Unicode + DefWindowProcW)\n");
-    }
-    if (MH_CreateHookApi(L"user32", "SetWindowTextA",
-        (void*)&SetWindowTextA_Hook, (void**)&g_origSetWindowTextA) == MH_OK) {
-        Log("[LOCALE] SetWindowTextA hooked (-> DefWindowProcW)\n");
     }
     if (MH_CreateHookApi(L"user32", "DialogBoxParamA",
         (void*)&DialogBoxParamA_Hook, (void**)&g_origDialogBoxParamA) == MH_OK) {
@@ -4815,63 +4946,62 @@ static int WINAPI WideCharToMultiByte_Hook(
 }
 
 //=============================================================================
-// CreateWindowExA Hook - Create windows with Unicode title
+// CreateWindowExA Hook - Unicode caption on an ANSI window
 //=============================================================================
 static HWND WINAPI CreateWindowExA_Hook(
     DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle,
     int x, int y, int nWidth, int nHeight,
     HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam)
 {
-    // Convert class name to Unicode (handle ATOM case)
-    wchar_t wideClassName[256] = {};
-    LPCWSTR pWideClassName = nullptr;
-    if (lpClassName) {
-        if ((uintptr_t)lpClassName <= 0xFFFF) {
-            // It's an ATOM, pass as-is
-            pWideClassName = (LPCWSTR)lpClassName;
-        } else {
-            g_origMultiByteToWideChar(932, 0, lpClassName, -1, wideClassName, 256);
-            pWideClassName = wideClassName;
-        }
-    }
+    // Create the window exactly as the game asked and replace only the caption.
+    // Going through CreateWindowExW meant converting the class name as CP932,
+    // although RegisterClassExA registered that name through the real ANSI code
+    // page; the two agree only while the name is ASCII. Registering the class as
+    // Unicode goes further, changing every message the engine's window procedure
+    // receives, and crashes the engine in wow64win.dll, in the thunk that
+    // dispatches window procedures into a 32-bit process.
+    HWND result = g_origCreateWindowExA(dwExStyle, lpClassName, lpWindowName, dwStyle,
+        x, y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
+    if (!result) return result;
 
-    // Convert window title to Unicode (with optional translation)
-    wchar_t wideTitle[512] = {};
-    LPCWSTR pWideTitle = nullptr;
-    
     // Only apply custom title to main window (top-level, has title, no parent)
     bool isMainWindow = (hWndParent == nullptr) && lpWindowName && lpWindowName[0];
-    
-    if (isMainWindow && Config::windowTitle[0] != '\0') {
-        // Custom window title from config
-        MultiByteToWideChar(CP_UTF8, 0, Config::windowTitle, -1, wideTitle, 512);
-        pWideTitle = wideTitle;
-    } 
+
+    wchar_t wideTitle[512];
+    LPCWSTR pWideTitle = nullptr;
+    // The main window can be created before LoadConfig returns, so without the
+    // flag this branch would read Config::windowTitle while the deferred thread
+    // is still writing it. The early call falls through to the Shift-JIS conversion
+    // below instead, and FixEarlyWindowProc applies the WindowTitle setting once
+    // the config is loaded.
+    if (isMainWindow && g_configLoaded.load(std::memory_order_acquire)
+        && Config::windowTitle[0] != '\0') {
+        if (MultiByteToWideChar(CP_UTF8, 0, Config::windowTitle, -1, wideTitle, 512) > 0)
+            pWideTitle = wideTitle;
+    }
     else if (lpWindowName && lpWindowName[0]) {
-        // Try to find UI translation (for dialogs, buttons, etc.)
+        // Both code pages are explicit, so this behaves the same whether or not
+        // the converter hooks have been armed yet.
         std::string uiTranslation = g_translationDB.FindUITranslation(lpWindowName);
-        if (!uiTranslation.empty()) {
-            // Found translation - convert UTF-8 to Unicode
-            MultiByteToWideChar(CP_UTF8, 0, uiTranslation.c_str(), -1, wideTitle, 512);
-        } else {
-            // No translation - just convert SJIS to Unicode
-            g_origMultiByteToWideChar(932, 0, lpWindowName, -1, wideTitle, 512);
-        }
-        pWideTitle = wideTitle;
+        UINT cp = uiTranslation.empty() ? 932u : CP_UTF8;
+        const char* src = uiTranslation.empty() ? lpWindowName : uiTranslation.c_str();
+        if (MultiByteToWideChar(cp, 0, src, -1, wideTitle, 512) > 0)
+            pWideTitle = wideTitle;
     }
 
-    // Create window using Unicode API
-    HWND result = CreateWindowExW(dwExStyle, pWideClassName, pWideTitle, dwStyle,
-        x, y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
-
-    // Force-set the window text using DefWindowProcW
-    // This bypasses the ANSI WndProc and sets Unicode text directly
-    if (result && pWideTitle) {
+    // DefWindowProcW stores the caption as UTF-16 without passing it through the
+    // class's ANSI conversion. The class comes from RegisterClassExA, so
+    // SetWindowTextW here would convert the text down to the process code page
+    // and lose every Japanese character, which is the bug this path exists to
+    // avoid. Windows does not document the difference, so the substitution looks
+    // harmless; it is not. One consequence: anything that reads the caption
+    // through an A API gets a lossy conversion of it - see FindWindowA_Hook.
+    if (pWideTitle) {
         DefWindowProcW(result, WM_SETTEXT, 0, (LPARAM)pWideTitle);
     }
 
     // Track main window for SetWindowTextA filtering
-    if (result && isMainWindow && g_mainGameWindow == nullptr) {
+    if (isMainWindow && g_mainGameWindow == nullptr) {
         g_mainGameWindow = result;
     }
 
@@ -4940,6 +5070,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
         const wchar_t* name = wcsrchr(path, L'\\');
         name = name ? name + 1 : path;
         if (_wcsicmp(name, L"winmm.dll") == 0) proxy_init();  // only proxy when we ARE winmm.dll
+        // lpReserved is non-null when the loader maps this DLL as a static
+        // import and null when a program calls LoadLibrary. Installing hooks
+        // from here is only safe on the static path, where this thread is the
+        // one starting the process. On a dynamic load the process is already
+        // running, so MH_EnableHook would freeze arbitrary threads while this
+        // thread holds the loader lock, and Initialize() installs them on that
+        // path instead.
+        if (lpReserved) EnsureWindowHooksInstalled();
         CreateThread(nullptr, 0, DeferredInit, nullptr, 0, nullptr);
         break;
     }
