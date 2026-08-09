@@ -376,7 +376,7 @@ static void LoadConfig() {
 static std::atomic<bool> g_discordRunning{false};
 static HANDLE g_discordThread = nullptr;
 static std::mutex g_discordMutex;
-static bool g_presenceTimerSet = false;
+static std::atomic<int64_t> g_presenceStart{0};
 static std::string g_currentChapter = "Loading...";
 
 static const char* DISCORD_CLIENT_ID = "1466328361583251488";
@@ -387,7 +387,6 @@ static void OnDiscordReady(const DiscordUser* connectedUser) {
 
 static void OnDiscordDisconnected(int errcode, const char* message) {
     Log("[Discord] Disconnected (%d): %s\n", errcode, message);
-    g_discordRunning = false;
 }
 
 static void OnDiscordError(int errcode, const char* message) {
@@ -407,12 +406,16 @@ static void UpdateDiscordPresence() {
     rp.details        = chapter.c_str();
     rp.largeImageKey  = "icon";
     rp.largeImageText = "";
-    if (!g_presenceTimerSet) {
+    int64_t start = g_presenceStart.load(std::memory_order_relaxed);
+    if (start == 0) {
         auto now = std::chrono::system_clock::now();
-        rp.startTimestamp = std::chrono::duration_cast<std::chrono::seconds>(
+        start = std::chrono::duration_cast<std::chrono::seconds>(
             now.time_since_epoch()).count();
-        g_presenceTimerSet = true;
+        int64_t expected = 0;
+        if (!g_presenceStart.compare_exchange_strong(expected, start))
+            start = expected;   // another thread got there first
     }
+    rp.startTimestamp = start;
 
     Discord_UpdatePresence(&rp);
 }
@@ -453,7 +456,7 @@ static void ShutdownDiscordRPC() {
         CloseHandle(g_discordThread);
         g_discordThread = nullptr;
     }
-    g_presenceTimerSet = false;
+    g_presenceStart.store(0, std::memory_order_relaxed);
     Discord_ClearPresence();
     Discord_Shutdown();
 }
@@ -1007,9 +1010,14 @@ public:
     // `file`/`index` locate the exact MESSAGE command being executed. When they
     // resolve, the translation is unique to that occurrence; otherwise we fall
     // back to matching the whole text, which collapses duplicate lines.
+    // countMiss is false for a lookup that is a second chance at text another
+    // hook has already translated. Those miss by design; counting them reports
+    // every finished line as untranslated and writes it to untranslated.tsv,
+    // which is the translators' to-do list.
     std::string FindMessageTranslation(const char* sjisMessage,
                                        const std::string& file = std::string(),
-                                       int index = -1) {
+                                       int index = -1,
+                                       bool countMiss = true) {
         if (!sjisMessage || !*sjisMessage) return std::string();
 
         std::string utf8Key = Encoding::SjisToUtf8(sjisMessage);
@@ -1088,6 +1096,7 @@ public:
 
         // Backlog entries are stored post-translation, so they always miss.
         if (t_inHistory) return std::string();
+        if (!countMiss)  return std::string();
 
         m_missCount++;
         {
@@ -2517,8 +2526,11 @@ static void __fastcall PrintEx_Hook(
         std::string sjis;
         CharRestore::Map lost;
 
+        // countMiss=false: say() already counted this line, and by here it has
+        // usually replaced the text with English, so this lookup misses on
+        // material that is in fact translated.
         std::string tlUtf8 = g_translationDB.FindMessageTranslation(
-            message, CurrentSceneFile(), t_cmdIndex);
+            message, CurrentSceneFile(), t_cmdIndex, /*countMiss=*/false);
         if (!tlUtf8.empty()) {
             sjis = Encoding::Utf8ToSjisTracked(tlUtf8.c_str(), lost);
             CharRestore::Register(sjis, lost);
@@ -2918,18 +2930,25 @@ namespace JpFallback {
         HFONT cur = (HFONT)GetCurrentObject(hdc, OBJ_FONT);
         if (!cur) return nullptr;
 
+        // Both outcomes have to short-circuit: a missing character comes back on
+        // every redraw, and the textOut renderer repeats each fragment for the
+        // outline pass, so caching only the hit would leave the miss querying
+        // GDI per glyph per pass.
         const uint64_t key = ((uint64_t)(uintptr_t)cur << 32) | (uint64_t)wc;
+        bool absent = false;
+        bool known  = false;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             auto it = g_missing.find(key);
-            if (it != g_missing.end() && !it->second) return nullptr;
+            if (it != g_missing.end()) { absent = it->second; known = true; }
         }
 
-        WORD gi = 0;
-        if (GetGlyphIndicesW(hdc, &wc, 1, &gi, GGI_MARK_NONEXISTING_GLYPHS) == GDI_ERROR)
-            return nullptr;
-        const bool absent = (gi == 0xFFFF);
-        {
+        if (!known) {
+            WORD gi = 0;
+            if (GetGlyphIndicesW(hdc, &wc, 1, &gi, GGI_MARK_NONEXISTING_GLYPHS) == GDI_ERROR)
+                return nullptr;
+            absent = (gi == 0xFFFF);
+
             std::lock_guard<std::mutex> lock(g_mutex);
             g_missing[key] = absent;
         }
