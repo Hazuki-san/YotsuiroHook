@@ -221,14 +221,15 @@ static void SaveDefaultConfig() {
     fprintf(f, "[Text]\n");
     fprintf(f, "; Wrap mode:\n");
     fprintf(f, ";   pixel = fit to the in-game text box, using the game's font\n");
-    fprintf(f, ";   chars = fixed character count, see WordWrapWidth\n");
+    fprintf(f, ";   chars = fixed column count, see WordWrapWidth\n");
     fprintf(f, ";   off   = don't wrap\n");
     fprintf(f, "WrapMode=pixel\n");
     fprintf(f, "\n");
     fprintf(f, "; Pixels kept clear of the box edge (raise if words still split)\n");
     fprintf(f, "WrapSafetyPx=12\n");
     fprintf(f, "\n");
-    fprintf(f, "; Word wrap width (characters per line, 0=disable) - chars mode only\n");
+    fprintf(f, "; Word wrap width in halfwidth columns (a Japanese character counts 2,\n");
+    fprintf(f, "; so 70 fits 70 Latin or 35 Japanese). 0=disable - chars mode only\n");
     fprintf(f, "WordWrapWidth=70\n");
     fprintf(f, "\n");
     fprintf(f, "; Warn when a line needs more lines than the box can show\n");
@@ -2106,8 +2107,9 @@ namespace WordWrap {
     // Release the private measuring DC and font (process detach).
     static void ReleaseMeasureDC() {
         std::lock_guard<std::mutex> lock(g_fontMutex);
-        if (g_measureFont) { DeleteObject(g_measureFont); g_measureFont = nullptr; }
+        // DC first: DeleteObject fails on a font still selected into one.
         if (g_measureDC)   { DeleteDC(g_measureDC);       g_measureDC = nullptr; }
+        if (g_measureFont) { DeleteObject(g_measureFont); g_measureFont = nullptr; }
         ZeroMemory(&g_measureFontLf, sizeof(g_measureFontLf));
     }
 
@@ -2357,7 +2359,21 @@ namespace WordWrap {
         return result;
     }
 
-    // Character-count wrap (old behaviour, kept as fallback)
+    static int ColumnsFrom(const std::string& s, size_t from) {
+        int n = 0;
+        for (size_t k = from; k < s.size(); ) {
+            bool dbcs = IsSjisLead((unsigned char)s[k]) && k + 1 < s.size();
+            n += dbcs ? 2 : 1;
+            k += dbcs ? 2 : 1;
+        }
+        return n;
+    }
+
+    // maxWidth counts halfwidth columns, so a fullwidth character costs 2 and
+    // a width of 70 holds 70 Latin characters or 35 Japanese ones.
+    //
+    // No kinsoku here, unlike WrapPixels: a hard break can leave 、or 。at the
+    // start of a line. Pixel mode is the default and does apply it.
     static std::string WrapByChars(const std::string& text, int maxWidth) {
         if (text.empty() || maxWidth <= 0) return text;
 
@@ -2380,31 +2396,28 @@ namespace WordWrap {
                 continue;
             }
 
-            if (IsSjisLead(c) && i + 1 < text.size()) {
-                result += text[i];
-                result += text[i + 1];
-                lineLen += 2;
-                i += 2;
-                continue;
-            }
+            const bool dbcs = IsSjisLead(c) && i + 1 < text.size();
+            const int  cols = dbcs ? 2 : 1;
 
-            if (c == ' ') {
-                lastSpace = result.size();
-            }
-
-            result += c;
-            lineLen++;
-
-            if (lineLen >= maxWidth) {
+            if (lineLen + cols > maxWidth && lineLen > 0) {
                 if (lastSpace != std::string::npos && lastSpace > lineStart) {
                     result[lastSpace] = '\n';
-                    lineLen = (int)(result.size() - lastSpace - 1);
                     lineStart = lastSpace + 1;
-                    lastSpace = std::string::npos;
+                    lineLen = ColumnsFrom(result, lineStart);
+                } else {
+                    result += '\n';
+                    lineStart = result.size();
+                    lineLen = 0;
                 }
+                lastSpace = std::string::npos;
             }
 
-            i++;
+            if (!dbcs && c == ' ') lastSpace = result.size();
+
+            result += text[i];
+            if (dbcs) result += text[i + 1];
+            lineLen += cols;
+            i += cols;
         }
 
         return result;
@@ -2914,13 +2927,16 @@ static int __fastcall SaveDataTitle_Hook(
     DWORD* item = (DWORD*)g_SaveDataGetItem(pThis, slotType, slotIndex);
 
     // Empty slot - call original
-    if (item[0] == 0) {
+    if (!item || item[0] == 0) {
         if (trace) Log("[SAVE] Empty slot\n");
         return g_origSaveDataTitle(pThis, fcString, slotType, slotIndex, useTemplate, outTime);
     }
 
     // Get label
     DWORD labelFCString = item[2];
+    if (!labelFCString) {
+        return g_origSaveDataTitle(pThis, fcString, slotType, slotIndex, useTemplate, outTime);
+    }
     const char* labelSjis = *(const char**)(labelFCString + 0x14);
     if (trace) {
         Log("[SAVE] Label raw: %p -> \"%s\"\n", labelSjis,
@@ -2932,12 +2948,6 @@ static int __fastcall SaveDataTitle_Hook(
     std::string translatedSjis;
 
     if (labelSjis && *labelSjis) {
-        // Track current label for scene info
-        {
-            std::lock_guard<std::mutex> lock(g_sceneMutex);
-            g_currentLabel = Encoding::SjisToUtf8(labelSjis);
-        }
-
         std::string translated = g_translationDB.FindLabelTranslation(labelSjis);
 
         if (!translated.empty()) {
@@ -4320,12 +4330,12 @@ static INT_PTR WINAPI DialogBoxParamA_Hook(
     // stays captureless so it still converts to a HOOKPROC.
     thread_local HHOOK s_cbtHook = nullptr;
     thread_local std::string s_pendingTitle;
+    thread_local bool s_seenFirstCreate = false;
 
     auto cbtProc = [](int nCode, WPARAM wParam, LPARAM lParam) -> LRESULT {
         if (nCode == HCBT_CREATEWND) {
-            // Window is being created - we can access CREATESTRUCT
-            // Only capture the FIRST window (the dialog itself), not child controls
-            if (s_pendingTitle.empty()) {
+            if (!s_seenFirstCreate) {
+                s_seenFirstCreate = true;
                 CBT_CREATEWND* pCreate = (CBT_CREATEWND*)lParam;
                 if (pCreate && pCreate->lpcs && pCreate->lpcs->lpszName) {
                     // lpszName is actually Unicode (wchar_t*) even for ANSI API calls
@@ -4364,6 +4374,7 @@ static INT_PTR WINAPI DialogBoxParamA_Hook(
     };
     
     s_pendingTitle.clear();
+    s_seenFirstCreate = false;
     s_cbtHook = SetWindowsHookExW(WH_CBT, cbtProc, nullptr, GetCurrentThreadId());
     
     INT_PTR result = g_origDialogBoxParamA(hInstance, lpTemplateName, hWndParent, lpDialogFunc, dwInitParam);
@@ -4447,7 +4458,10 @@ static HMODULE WINAPI LoadLibraryExA_Hook(LPCSTR lpLibFileName, HANDLE hFile, DW
         if (_stricmp(name, "resident.dll") == 0) {
             Log("[*] resident.dll loaded\n");
             InstallHooks(result);
-            MH_DisableHook((void*)&LoadLibraryExA);
+            if (MH_STATUS st = MH_DisableHook((void*)&LoadLibraryExA); st != MH_OK) {
+                Log("[!] MH_DisableHook(LoadLibraryExA) returned %d"
+                    " - this hook stays live for the process\n", st);
+            }
         }
     }
 
