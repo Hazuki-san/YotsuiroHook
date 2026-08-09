@@ -40,16 +40,31 @@ namespace Offsets {
 //=============================================================================
 // Print Context Layout (resident.dll)
 //=============================================================================
-// Geometry and font of the message box, reached from printEx's "this":
+// The print context stores the message box geometry and font. It is the only
+// structure that tells us the usable line width. Reach it from the print
+// manager by following two pointers:
 //
 //   ctx = *(void**)(*(void**)(printMgr + Target) + FCStringData)
 //
-//   newline target : x = RectLeft + Indent,  y = PenY + LineHeight
-//   usable width   : RectRight - (RectLeft + Indent)
-//   pen advance    : x += GLYPHMETRICS.gmCellIncX, per character
+// The engine lays out text using three values from this context:
 //
-// Porting to another ExHIBIT title means re-deriving this table; the rest of
-// WordWrap is engine-independent.
+//   newline position : x = RectLeft + Indent,  y = PenY + LineHeight
+//   usable width     : RectRight - (RectLeft + Indent)
+//   pen advance      : x += GLYPHMETRICS.gmCellIncX, per character
+//
+// Note on pen advance: the engine does not use gmCellIncX directly. The glyph
+// rasterizer stores gmCellIncX + 4, and the pen-movement routine subtracts 4
+// when applying the stored value. The two adjustments cancel, so each
+// character advances the pen by exactly gmCellIncX.
+//
+// gmCellIncX comes from the installed font file, not from the engine. Two
+// machines with different builds of MS Gothic or MS PGothic produce different
+// pixel widths for the same text. This is why line breaks must be computed
+// from pixel measurements, not character counts.
+//
+// These offsets are specific to this game's resident.dll. To port this hook
+// to another ExHIBIT title, re-derive this table; the rest of the WordWrap
+// code does not depend on the engine.
 namespace PrintMgrOffsets {
     constexpr size_t Target       = 0x38;  // -> FCString-like holder
     constexpr size_t FCStringData = 0x14;  // holder -> print context
@@ -301,8 +316,10 @@ static void ReadString(const char* section, const char* key, const char* default
     GetPrivateProfileStringA(section, key, defaultVal, out, (DWORD)outSize, Config::configFile);
 }
 
-// SaveDefaultConfig only runs on a fresh file, so an existing INI never gains
-// keys added since.
+// SaveDefaultConfig runs only when the INI file does not exist, so an
+// existing INI never receives keys added in later versions of this hook.
+// IniEnsure writes each missing key back to the file so users can find and
+// edit it.
 static std::vector<std::string> g_iniKeysAdded;
 static std::vector<std::string> g_iniKeysFailed;
 
@@ -506,8 +523,9 @@ static void InitDiscordRPC() {
 
     g_discordThread = CreateThread(nullptr, 0, DiscordUpdateThreadProc, nullptr, 0, nullptr);
     if (!g_discordThread) {
-        // Nothing would call Discord_RunCallbacks, so the connection never
-        // completes and every later update queues into a dead pipe.
+        // If the update thread cannot start, nothing calls Discord_RunCallbacks.
+        // The connection would never complete, and every later presence update
+        // would be queued but never delivered. Disable presence instead.
         Log("[Discord] CreateThread failed (error %lu) - presence disabled\n", GetLastError());
         g_discordRunning = false;
         Discord_Shutdown();
@@ -590,8 +608,10 @@ static void InitConsole() {
     g_earlyLogDone = true;
 }
 
-// Disk log. The console is capped by its screen buffer and re-encodes Japanese,
-// so it loses the start of a session and mangles text.
+// Log file on disk. The console is not a reliable record: its scrollback
+// buffer is limited, so early output is lost in long sessions, and its
+// code-page conversion can corrupt Japanese text. The disk log keeps
+// everything as UTF-8.
 static FILE* g_diskLog = nullptr;
 
 static void InitDiskLog() {
@@ -603,11 +623,12 @@ static void InitDiskLog() {
     if (fopen_s(&f, Config::logFile, "wb") != 0 || !f) return;
 
     static const unsigned char kBom[] = { 0xEF, 0xBB, 0xBF };
-    fwrite(kBom, 1, sizeof(kBom), f);   // so editors read it as UTF-8
+    fwrite(kBom, 1, sizeof(kBom), f);   // UTF-8 BOM so editors detect the encoding
 
     std::lock_guard<std::mutex> lock(g_logMutex);
     g_diskLog = f;
-    if (!g_earlyLog.empty()) {          // replay anything logged before this
+    // Write any messages that were logged before this file was opened.
+    if (!g_earlyLog.empty()) {
         fputs(g_earlyLog.c_str(), g_diskLog);
         fflush(g_diskLog);
     }
@@ -756,9 +777,12 @@ namespace Encoding {
         return sjis;
     }
 
-    // As Utf8ToSjis, but reports what CP932 could not carry. Those are best-fit
-    // away silently and the call still reports success, so `lost` maps byte
-    // offsets in the returned string to the original character.
+    // Same as Utf8ToSjis, but also reports characters that CP932 cannot
+    // represent (em dashes, accented Latin letters). WideCharToMultiByte
+    // replaces those characters with a best-fit substitute and still returns
+    // success, so the caller cannot detect the loss from the return value.
+    // On return, `lost` maps each byte offset in the output string to the
+    // original character that was replaced at that offset.
     std::string Utf8ToSjisTracked(const char* utf8,
                                   std::unordered_map<size_t, wchar_t>& lost) {
         lost.clear();
@@ -780,12 +804,14 @@ namespace Encoding {
             int n = WideCharToMultiByte(932, WC_NO_BEST_FIT_CHARS, &wide[i], 1,
                                         buf, sizeof(buf), nullptr, &usedDefault);
             if (n > 0 && !usedDefault) {
-                sjis.append(buf, n);        // CP932 carries it for real
+                sjis.append(buf, n);        // The character converts cleanly; keep it.
                 continue;
             }
-            // Not representable. Emit whatever best-fit produces (an unaccented
-            // letter, or '?') so the string stays valid Shift-JIS and a missing
-            // hook degrades to today's output rather than to garbage.
+            // This character has no CP932 encoding. Emit the best-fit substitute
+            // (an unaccented letter, or '?') so the string remains valid Shift-JIS,
+            // and record what was lost so the glyph hook can draw the original
+            // character later. If that hook is missing or fails, the text still
+            // renders with the substitute instead of garbage.
             n = WideCharToMultiByte(932, 0, &wide[i], 1, buf, sizeof(buf), nullptr, nullptr);
             if (n <= 0) { buf[0] = '?'; n = 1; }
             lost[sjis.size()] = wide[i];
@@ -879,16 +905,17 @@ namespace {
     std::string g_currentFile;
     std::string g_currentLabel;
 
-    // Command index of the MESSAGE currently being dispatched.
-    // Captured by CmdMessage_Hook, consumed by AdvCharSay_Hook to key the lookup on
-    // (file, index) instead of on the message text.
-    // -1 when say() is reached from any path other than cmdMessage.
+    // Index of the MESSAGE command currently being dispatched. CmdMessage_Hook
+    // sets it; AdvCharSay_Hook uses it to look up the translation by
+    // (file, index) instead of by message text. It is -1 when say() is reached
+    // from any path other than cmdMessage.
     thread_local int t_cmdIndex = -1;
 
-    // Set while the backlog is being redrawn. drawHistory() runs from hitwait(),
-    // still inside cmdMessage, so t_cmdIndex is the live line's index and would
-    // key every backlog entry to it. Also keeps backlog scrolling out of scene
-    // tracking and the miss stats.
+    // True while the engine redraws the backlog. drawHistory() is called from
+    // hitwait(), which runs inside cmdMessage, so t_cmdIndex still holds the
+    // live line's index during the redraw; without this flag, every backlog
+    // entry would be looked up with that index. The flag also excludes backlog
+    // redraws from scene tracking and the miss statistics.
     thread_local bool t_inHistory = false;
 
     std::string CurrentSceneFile() {
@@ -1013,13 +1040,15 @@ public:
         Log("[TL]   %d UI strings (from %s)\n", uiCount, Config::uiFile);
 
         LoadSummary summary;
-        // Files that exist, not files that parsed - unreadable scripts leave
-        // splitFiles at 0.
+        // sourceFound reports whether any translation file exists, not whether it
+        // parsed: a script file that exists but cannot be read leaves splitFiles
+        // at 0 and still counts as found.
         summary.sourceFound = !scriptFiles.empty() ||
                               (tsvPath && FileExists(tsvPath)) ||
                               (namesPath && FileExists(namesPath)) ||
                               FileExists(Config::uiFile);
-        // Not m_messages: CHOICE_ rows land there too, and would pass as dialogue.
+        // Use textCount, not m_messages.size(): m_messages also contains CHOICE_
+        // rows, which would make it look as if dialogue was loaded.
         summary.dialogueFound = textCount > 0;
         return summary;
     }
@@ -1065,12 +1094,12 @@ public:
         Log("\n");
     }
 
-    // Context-aware name lookup
-    // NOTE: every Find* returns by VALUE. Returning a pointer into the maps is
-    // unsafe because Load() (hot reload, F5, or the file-watcher thread) calls
-    // clear() on them -- a caller still holding that pointer would dereference
-    // freed memory. An empty return means "no translation"; rows with an empty
-    // TRANSLATION column are dropped at load, so empty is never a valid hit.
+    // All Find* methods return by value. Do not change them to return pointers
+    // or references into the maps: Load() clears the maps during hot reload
+    // (F5 or the file-watcher thread), which would leave callers holding
+    // dangling pointers. An empty string means "no translation". This is
+    // unambiguous because rows with an empty TRANSLATION column are dropped at
+    // load time, so a real translation is never empty.
 
     std::string FindNameTranslation(const char* sjisName, const char* sjisMessage) {
         if (!sjisName || !*sjisName) return std::string();
@@ -1099,13 +1128,17 @@ public:
         return std::string();
     }
 
-    // `file`/`index` locate the exact MESSAGE command being executed. When they
-    // resolve, the translation is unique to that occurrence; otherwise we fall
-    // back to matching the whole text, which collapses duplicate lines.
-    // countMiss is false for a lookup that is a second chance at text another
-    // hook has already translated. Those miss by design; counting them reports
-    // every finished line as untranslated and writes it to untranslated.tsv,
-    // which is the translators' to-do list.
+    // `file` and `index` identify the exact MESSAGE command being executed.
+    // When they match a TSV row, the translation applies to that specific
+    // occurrence, which lets duplicate lines have different translations.
+    // Otherwise, fall back to a text lookup, which returns the same translation
+    // for every occurrence of the text.
+    //
+    // Pass countMiss=false when this lookup is a second attempt on text that an
+    // earlier hook already translated. Those lookups are expected to miss. If
+    // they were counted, every already-translated line would be recorded as
+    // untranslated and appended to untranslated.tsv, which translators use as
+    // the list of lines still to do.
     std::string FindMessageTranslation(const char* sjisMessage,
                                        const std::string& file = std::string(),
                                        int index = -1,
@@ -1122,10 +1155,11 @@ public:
         {
             std::lock_guard<std::mutex> lock(m_dataMutex);
 
-            // The index is only valid for the MESSAGE being dispatched, so check
-            // the ORIGINAL at (file, index) matches the text we were handed.
-            // Anything else inherits a stale t_cmdIndex and resolves to the
-            // wrong line -- the backlog redraw did exactly that.
+            // t_cmdIndex is only valid for the MESSAGE command currently being
+            // dispatched. Verify that the ORIGINAL text stored at (file, index)
+            // matches the text we received; otherwise this call inherited a
+            // stale index and a positional lookup would return the wrong line.
+            // (The backlog redraw used to trigger exactly that bug.)
             if (!t_inHistory && !file.empty() && index >= 0) {
                 auto key = std::make_pair(file, index);
                 auto origIt = m_originalByFileIndex.find(key);
@@ -1164,7 +1198,8 @@ public:
                 m_usedKeys.insert(utf8Key);
             }
 
-            // Backlog scrolling is not story progress - don't move the scene.
+            // Don't update the scene or Discord presence while the user scrolls
+            // the backlog; it is not story progress.
             if (!t_inHistory) {
                 if (!sceneFile.empty()) {
                     std::lock_guard<std::mutex> sceneLock(g_sceneMutex);
@@ -1186,7 +1221,8 @@ public:
             return result;
         }
 
-        // Backlog entries are stored post-translation, so they always miss.
+        // Backlog entries were translated before they were stored, so lookups
+        // on them always miss. Don't count those misses.
         if (t_inHistory) return std::string();
         if (!countMiss)  return std::string();
 
@@ -1438,10 +1474,12 @@ private:
         return true;
     }
 
-    // List *.tsv in a directory, sorted. Empty vector if the folder is absent.
-    // ScriptsDir is assumed dedicated: pointing it at .\tl also feeds
-    // unique_names/ui/translation through here, and they are rejected only by
-    // column-shape accident.
+    // Returns the sorted list of *.tsv files in a directory, or an empty vector
+    // if the directory does not exist. ScriptsDir must contain only script
+    // TSVs: if it is pointed at .\tl, this function also returns
+    // unique_names.tsv, ui.tsv, and translation.tsv, and those are currently
+    // rejected only because their column layout happens not to parse as a
+    // script.
     static std::vector<std::string> ListTsvFiles(const char* dir) {
         std::vector<std::string> out;
         if (!dir || !*dir) return out;
@@ -1504,13 +1542,15 @@ private:
 
             auto key = std::make_pair(fileId, index);
 
-            // An empty TRANSLATION means "not translated yet" and must NEVER reach a lookup map.
+            // An empty TRANSLATION column means "not translated yet". Never insert
+            // it into a lookup map; callers treat an empty result as "no
+            // translation".
             const bool hasTl = !translated.empty();
 
             if (type == "NAME") {
-                // namesByIndex/m_originalNamesByIndex are a paired lookup
-                // consumed later in Load(); both sides are needed even when
-                // untranslated, and that consumer checks for empty itself.
+                // namesByIndex and m_originalNamesByIndex are consumed as a pair
+                // later in Load(). Store both even when the translation is empty;
+                // that consumer checks for empty itself.
                 namesByIndex[key] = translated;
                 m_originalNamesByIndex[key] = original;
             } else if (type == "TEXT" || type == "MSG") {
@@ -1532,9 +1572,9 @@ private:
                     m_labels[original] = translated;
                     labelCount++;
                 }
-                // GetNearestLabel() is scene tracking, not display: it wants a
-                // human-readable name for logging and Discord even when the
-                // label has no translation, so fall back to the original.
+                // m_labelsByFileIndex feeds scene tracking (logging and Discord),
+                // not display. A readable name is useful even without a
+                // translation, so fall back to the original text.
                 m_labelsByFileIndex[key] = hasTl ? translated : original;
             } else if (type.rfind("CHOICE_", 0) == 0) {
                 if (hasTl) {
@@ -1542,9 +1582,11 @@ private:
                     choiceCount++;
                 }
             } else if (type == "SAVEDESC") {
-                // AUTOSAVE(0x0C) string -> UxAdvSystem::autoSave -> saveEngine()
-                // save-slot title, surfaced by RetouchSaveDataControl::title()
-                // on the same path as a BLOCK label.
+                // SAVEDESC rows are autosave slot titles: the AUTOSAVE (0x0C)
+                // command passes this string through UxAdvSystem::autoSave to
+                // saveEngine(), and RetouchSaveDataControl::title() displays it
+                // through the same path as a BLOCK label, so store it with the
+                // labels.
                 if (hasTl) {
                     m_labels[original] = translated;
                     labelCount++;
@@ -1603,8 +1645,10 @@ static Fn_CreateFontIndirectA g_origCreateFontIndirectA = nullptr;
 //=============================================================================
 // Bundled fonts
 //=============================================================================
-// Wine renders a face that comes from a FontSubstitutes alias, but it does not
-// enumerate one. The probe below therefore does not find it.
+// Wine quirk: a face that is available only through a FontSubstitutes
+// alias renders correctly, but font enumeration does not report it.
+// FontProbe below relies on enumeration, so it reports such a face as not
+// installed.
 static std::vector<std::pair<std::wstring, DWORD>> g_bundledFonts;
 
 static void LoadBundledFonts() {
@@ -1629,7 +1673,8 @@ static void LoadBundledFonts() {
 
         std::wstring path = base + fd.cFileName;
 
-        // Older Wine does not enumerate FR_PRIVATE faces.
+        // Older Wine versions do not enumerate fonts added with FR_PRIVATE.
+        // If the private load fails, retry as a shared (system-wide) load.
         DWORD flags = FR_PRIVATE;
         int added = AddFontResourceExW(path.c_str(), flags, nullptr);
         if (!added) {
@@ -1655,11 +1700,14 @@ static void UnloadBundledFonts() {
 //=============================================================================
 // Font capability probe
 //=============================================================================
-// Asking for a Latin-only face at SHIFTJIS_CHARSET doesn't fail - GDI drops the
-// face and returns MS PGothic. GetTextFace can't detect it either: it reports
-// Japanese faces under their localized names, so comparing names false-negatives.
-// EnumFontFamiliesExA is the reliable question - one entry per charset the face
-// really has, none at all if it isn't installed.
+// Detects whether a face is installed and whether it supports Shift-JIS.
+//
+// CreateFont with SHIFTJIS_CHARSET does not fail for a Latin-only face:
+// GDI silently substitutes MS PGothic. GetTextFace cannot detect the
+// substitution either, because it can report Japanese faces under their
+// localized names, so comparing names produces false negatives.
+// EnumFontFamiliesExA gives a reliable answer: one callback per charset the
+// face actually supports, and no callbacks at all if it is not installed.
 namespace FontProbe {
     struct Info {
         bool installed = false;
@@ -1702,7 +1750,9 @@ namespace FontProbe {
         return info;
     }
 
-    // Set once a charset has been relaxed to keep a face; JpFallback reads it.
+    // Set to true after ApplyFontSubstitution downgrades a request to
+    // DEFAULT_CHARSET to keep a Latin-only face. JpFallback activates only
+    // when this is set.
     static std::atomic<bool> g_relaxed{ false };
 
     static void ReportOnce(const char* face, const Info& info) {
@@ -1726,9 +1776,10 @@ namespace FontProbe {
 }
 
 static void ApplyFontSubstitution(LOGFONTA& lf) {
-    // Proportional variant is usually marked by a fullwidth 'Ｐ' (SJIS 0x82 0x6F).
-    // NOTE: misses faces that are proportional without the marker - メイリオ,
-    //       which this game asks for, is substituted with a fixed-pitch face.
+    // Japanese font names usually mark the proportional variant with a
+    // fullwidth 'P' (SJIS 0x82 0x6F), as in MS PGothic. Known limitation:
+    // faces that are proportional without the marker, such as Meiryo
+    // (which this game requests), are treated as fixed-pitch.
     bool isProportional = (strstr(lf.lfFaceName, "\x82\x6F") != nullptr);
 
     const char* newFont;
@@ -1742,12 +1793,14 @@ static void ApplyFontSubstitution(LOGFONTA& lf) {
         else                                        { newFont = "MS Gothic";  custom = false; }
     }
 
-    // lfFaceName is LF_FACESIZE; the Config buffers are twice that. Truncate
-    // rather than let strcpy_s trip the invalid-parameter handler on a long name.
+    // lfFaceName holds LF_FACESIZE characters; the Config buffers hold
+    // twice that. Truncate long names; strcpy_s would invoke the
+    // invalid-parameter handler and crash.
     strncpy_s(lf.lfFaceName, newFont, _TRUNCATE);
 
-    // Ask for the charset the face can actually satisfy. Forcing SHIFTJIS on a
-    // Latin-only face is what silently discards it.
+    // Request a charset the face can actually satisfy. Requesting
+    // SHIFTJIS_CHARSET from a Latin-only face is what makes GDI silently
+    // substitute a different font.
     FontProbe::Info info = FontProbe::Query(lf.lfFaceName);
     lf.lfCharSet = info.sjis ? SHIFTJIS_CHARSET : DEFAULT_CHARSET;
 
@@ -1762,27 +1815,39 @@ static thread_local bool g_measuringGlyph = false;
 //=============================================================================
 // Character restoration
 //=============================================================================
-// Shift-JIS cannot carry em dashes or accented Latin; Utf8ToSjisTracked emits
-// letter and records what it dropped. Records are keyed by the SJIS text
-// itself, not by pointer: the same line is re-rendered from a different buffer
-// on backlog redraw, and names arrive from a different call site than messages.
-// PrintSub_Hook installs the matching record; the glyph hook reads it.
+// Restores characters that Shift-JIS cannot represent.
+//
+// Shift-JIS has no encoding for characters such as em dashes and accented
+// Latin letters. Utf8ToSjisTracked replaces each one with a best-fit
+// substitute and records the original character and its byte offset. When
+// the engine draws the substitute, GetGlyphOutlineA_Hook finds the record
+// and draws the original character instead (through GetGlyphOutlineW).
+//
+// Records are keyed by string content, not by pointer, for two reasons: a
+// backlog redraw renders the same line from a different buffer, and names
+// reach the renderer from a different call site than messages.
+// PrintSub_Hook selects the record for the string being printed; the glyph
+// hook consumes it.
 namespace CharRestore {
     typedef std::unordered_map<size_t, wchar_t> Map;
 
     static std::mutex                           g_mutex;
     static std::unordered_map<std::string, Map> g_registry;
 
-    // Wrap overwrites a space with '\n'; folding it back makes the drawn and
-    // converted text one entry. Must stay length-preserving or offsets shift.
+    // Registry key: the string with every '\n' replaced by ' '. Word
+    // wrapping replaces spaces with newlines, so the wrapped and unwrapped
+    // forms of a line differ only in those bytes; folding '\n' back to ' '
+    // makes both forms map to one entry. The replacement is byte-for-byte,
+    // which keeps every recorded offset valid.
     static std::string Key(const std::string& s) {
         std::string k = s;
         for (char& c : k) if (c == '\n') c = ' ';
         return k;
     }
 
-    // Not evicted - the backlog re-renders arbitrarily old lines. Only lines
-    // that lost a character register, so it stays small.
+    // Entries are never evicted, because the backlog can redraw a line from
+    // any earlier point in the session. Growth is bounded in practice:
+    // only lines that actually lost a character are registered.
     static void Register(const std::string& sjis, Map lost) {
         if (sjis.empty() || lost.empty()) return;
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -1799,10 +1864,12 @@ namespace CharRestore {
         auto it = g_registry.find(q);
         if (it != g_registry.end()) { out = it->second; return true; }
 
-        // drawHistory joins name + "\n" + message, and the message already
-        // carries wrap newlines, so the join is not reliably the first one.
-        // Both sides must be whole registry entries - matching partial content
-        // would give one line's records to another sharing the same letters.
+        // No exact match. drawHistory draws name + "\n" + message as one
+        // string, so try splitting at each newline and looking up both
+        // halves. The join is not necessarily the first newline, because
+        // the message may contain its own wrap newlines. Each half must
+        // match a complete registry entry; matching substrings could attach
+        // one line's records to a different line containing the same text.
         bool any = false;
         auto merge = [&](const std::string& part, size_t base) {
             auto p = g_registry.find(Key(part));
@@ -1812,7 +1879,7 @@ namespace CharRestore {
             return true;
         };
 
-        // Split on the raw text, not the folded key, which has no newlines left.
+        // Iterate over newlines in the raw input; the folded key has none.
         std::string raw(sjis);
         for (size_t nl = raw.find('\n'); nl != std::string::npos; nl = raw.find('\n', nl + 1)) {
             bool l = merge(raw.substr(0, nl), 0);
@@ -1822,9 +1889,12 @@ namespace CharRestore {
         return any;
     }
 
-    // Wrapping only inserts '\n' and deletes spaces, and a dropped character is
-    // never either, so a two-pointer walk realigns the offsets exactly.
-    // A mismatch means an assumption broke: drop the map rather than guess.
+    // Translates offsets from the pre-wrap string to the post-wrap string.
+    // Wrapping performs only two edits: inserting '\n' and deleting ' '.
+    // A replaced character is never either of those, so walking both
+    // strings with two pointers realigns every offset exactly. If the walk
+    // hits any other difference, an assumption is wrong; return an empty
+    // map instead of guessing.
     static Map Remap(const std::string& before, const std::string& after, const Map& src) {
         Map out;
         size_t i = 0, j = 0;
@@ -1846,8 +1916,10 @@ namespace CharRestore {
     static thread_local const char* t_str      = nullptr;
     static thread_local const void* t_printData = nullptr;
 
-    // printSub's UxPrintData. Iterator set up at 0x10171D40: +24 start,
-    // +28 cursor (CharNextA-walked), so cursor - start is the glyph offset.
+    // Offsets into printSub's UxPrintData argument. The engine initializes
+    // an iterator at 0x10171D40: +24 holds the start of the string and +28
+    // holds the cursor, which the engine advances with CharNextA. So
+    // (cursor - start) is the byte offset of the glyph being drawn.
     constexpr size_t kIterStart  = 24;
     constexpr size_t kIterCursor = 28;
 
@@ -1864,9 +1936,11 @@ namespace CharRestore {
         return it == t_map.end() ? 0 : it->second;
     }
 
-    // No UxPrintData here, so the position comes from the engine's own walk:
-    // it calls CharNextA then GetGlyphOutlineA with no CharNextA between,
-    // so the last CharNextA argument is the glyph being drawn.
+    // The textOut renderers do not pass UxPrintData, so there is no cursor
+    // structure to read. Instead, track the engine's own string walk: the
+    // renderer calls CharNextA on a character and rasterizes it before the
+    // next CharNextA call, so the most recent CharNextA argument is the
+    // address of the glyph currently being drawn.
     static thread_local bool        t_toArmed = false;
     static thread_local const char* t_toBase  = nullptr;  // fragment start
     static thread_local const char* t_toCur   = nullptr;  // glyph being drawn
@@ -1879,8 +1953,10 @@ namespace CharRestore {
         t_toMap.clear();
     }
 
-    // The fragment is an engine-owned copy, so the record is found by content
-    // rather than by pointer. Ambiguity is refused, not guessed.
+    // The renderer works on its own copy of the text, so find the matching
+    // record by content, not by pointer. If the fragment matches more than
+    // one registry entry, or occurs more than once inside an entry, do
+    // nothing: a wrong match would draw another line's characters.
     static void FragBegin(const char* frag) {
         t_toMap.clear();
         t_toBase = frag;
@@ -1890,7 +1966,9 @@ namespace CharRestore {
 
         std::lock_guard<std::mutex> lock(g_mutex);
 
-        // Exact first, or an unsplit line would be refused for also occurring inside a longer one.
+        // Check for an exact match first. Without this, a complete line
+        // that is also a substring of a longer entry would be rejected as
+        // ambiguous.
         auto exact = g_registry.find(f);
         if (exact != g_registry.end()) { t_toMap = exact->second; return; }
 
@@ -1899,8 +1977,8 @@ namespace CharRestore {
         for (const auto& [key, map] : g_registry) {
             size_t p = key.find(f);
             if (p == std::string::npos) continue;
-            if (hit) return;                                        // two lines
-            if (key.find(f, p + 1) != std::string::npos) return;    // twice in one
+            if (hit) return;                                        // occurs in two entries: ambiguous
+            if (key.find(f, p + 1) != std::string::npos) return;    // occurs twice in one entry: ambiguous
             hit = &map;
             hitOff = p;
         }
@@ -1912,8 +1990,10 @@ namespace CharRestore {
         }
     }
 
-    // If the tracked bytes disagree with uChar the walk assumption has broken
-    // on this build; degrade to best-fit spelling rather than a wrong glyph.
+    // Verify that the character at the tracked cursor is the one GDI was
+    // asked for. If they differ, the CharNextA-tracking assumption does not
+    // hold on this build; disable restoration for this path so the best-fit
+    // substitute renders instead of a wrong glyph.
     static wchar_t CharAtTextOut(UINT uChar) {
         if (!t_toBase || !t_toCur || t_toMap.empty() || g_measuringGlyph) return 0;
         if (t_toCur < t_toBase) return 0;
@@ -1956,14 +2036,17 @@ namespace WordWrap {
         LOGFONTA logFont;   // this context's font, substitution applied
     };
 
-    // Private DC for measuring. The engine's own font DC (+0x244) is refcounted
-    // and its acquire/release also drives palette selection, so we don't borrow
-    // it. The engine builds each context's font from a LOGFONTA at +0x1A4
-    // (0x10171220); copying that onto our own DC gives the same metrics.
+    // Private memory DC used for measuring. Do not borrow the engine's font
+    // DC (context +0x244): it is reference-counted, and its acquire/release
+    // path also selects the palette, so touching it from outside the engine
+    // could disturb rendering. The engine builds each context's HFONT from
+    // the LOGFONTA at +0x1A4 (see 0x10171220); creating the same font in
+    // our own DC gives identical metrics.
     //
-    // Per context, not global: the name box and message body have different
-    // fonts, and measuring the body with the name's font under-counts every
-    // advance, emits no break, and lets the engine cut mid-word.
+    // The font is per print context, not global. The name box and the
+    // message body use different fonts. Measuring the body with the name
+    // font under-reports every advance, so no break point is ever emitted
+    // and the engine truncates the line mid-word.
     static std::mutex g_fontMutex;
     static HDC        g_measureDC = nullptr;
     static HFONT      g_measureFont = nullptr;
@@ -1991,9 +2074,9 @@ namespace WordWrap {
 
             SelectObject(g_measureDC, nf);
             if (g_measureFont) {
-                // This font is a cache key. Freeing it without dropping its
-                // entries leaves them to be read by whatever later measure font
-                // GDI reissues the handle value to.
+                // The glyph cache is keyed by HFONT. Remove this font's entries
+                // before deleting it: GDI can reissue the same handle value for
+                // a future font, which would then read stale advances.
                 InvalidateGlyphsForFont(g_measureFont);
                 DeleteObject(g_measureFont);
             }
@@ -2059,8 +2142,9 @@ namespace WordWrap {
         // This context's own font; the engine builds its HFONT from here.
         memcpy(&out.logFont, (char*)ctx + PrintCtxOffsets::LogFont, sizeof(LOGFONTA));
 
-        // A rejection silently downgrades the whole feature to character wrap,
-        // so say which check failed and dump what was read. Once per session.
+        // A rejected context silently downgrades the feature to character
+        // wrap, so log which check failed and the values that were read.
+        // Log once per session.
         auto reject = [&](const char* why) -> bool {
             static bool s_said = false;
             if (!s_said) {
@@ -2097,9 +2181,11 @@ namespace WordWrap {
         return true;
     }
 
-    // Measure glyph advance. One call suffices - GDI fills identical metrics
-    // with or without a buffer. The scope flag stops substitution
-    // consulting the engine's cursor, which is unrelated to what we measure.
+    // Returns the pen advance for one glyph. A single call is enough: GDI
+    // fills in the same GLYPHMETRICS whether or not a bitmap buffer is
+    // supplied. g_measuringGlyph tells GetGlyphOutlineA_Hook not to apply
+    // character restoration; the engine's print cursor has nothing to do
+    // with the glyph measured here.
     static int GlyphAdvance(HDC hdc, UINT ch, UINT fuFormat) {
         struct MeasureScope {
             MeasureScope()  { g_measuringGlyph = true;  }
@@ -2408,10 +2494,18 @@ static std::atomic<bool> g_running{true};
 static HANDLE g_hotkeyThread = nullptr;
 static std::atomic<bool> g_modulePinFailed{false};
 
-// GetAsyncKeyState is global: F5 in an editor would reload in-game.
-// Keep both tests. The console reports the GAME's pid (measured) and opens in
-// front of it, so pid alone lets it through; a terminal host that owns its own
-// window is caught only by pid.
+// GetAsyncKeyState reads keys system-wide. Without a focus check, pressing
+// F5 in a text editor would reload the game's translations. Two checks are
+// required, and each covers a case the other misses:
+//
+// 1. Process ID: rejects keys typed into other applications. Not enough by
+//    itself, because the classic console window reports this process's PID
+//    (verified by testing, not assumed) and the console opens in front of
+//    the game, so keys typed into the console would pass.
+// 2. Console window: rejects keys typed into our own console. Not enough by
+//    itself, because a terminal host that owns its window (for example,
+//    Windows Terminal) runs under a different PID, which only check 1
+//    rejects.
 static bool GameHasFocus() {
     HWND fg = GetForegroundWindow();
     if (!fg) return false;
@@ -2438,7 +2532,8 @@ static DWORD WINAPI HotkeyThreadProc(LPVOID) {
             continue;
         }
 
-        // Rechecked after release: the key can be held through an alt-tab.
+        // Re-check focus after the key is released: the user can hold the
+        // key while alt-tabbing away.
         // Reload translations
         if (GetAsyncKeyState(Config::reloadHotkey) & 0x8000) {
             if (!WaitForKeyRelease(Config::reloadHotkey)) break;
@@ -2532,17 +2627,23 @@ static unsigned int __fastcall CalcIniValue_Hook(void* pThis, void* edx) {
 //=============================================================================
 // Hook: RetouchSystem::cmdMessage()
 //=============================================================================
-// Runs immediately before the say() that renders the line. CMD_DATA[0x00] is
-// the sequential command index assigned during load,
-// which matches the INDEX column in the TSV one-to-one
+// Runs immediately before the say() call that renders the line. Its job is
+// to capture the command's index so AdvCharSay_Hook can look up the
+// translation by (file, index) instead of by text.
 //
-// CMD_DATA layout, from RetouchSystem::liteExec and RetouchSystem::liteCommandInfo:
+// The index is read from the command record at +0xD4. liteExec writes it
+// there during dispatch: it computes the record address as
+// base + index * 0xD8 and then stores that same index into the record, so
+// the field reliably holds the command's position in the loaded script,
+// which is exactly what the TSV INDEX column contains.
 //
-//   +0x04   header dword: opcode<<0 | nparams<<16 | nstrings<<24 | flags<<28
-//   +0x08   int32 params[]
-//   +0x60   string records, 12 bytes each; the char* is at record+20
-//   +0xD4   command index          <-- liteExec: mov [edi+0D4h], eax
-//   0xD8    total record stride    <-- liteExec: imul edi, 0D8h
+// Record layout (from RetouchSystem::liteExec and liteCommandInfo):
+//   +0x04  header dword: opcode | nparams<<16 | nstrings<<24 | flags<<28
+//   +0x08  int32 params[]
+//   +0x60  string records, 12 bytes each; the char* is at record+20
+//          (cmdMessage reads the name from +0x60, the message from +0x6C)
+//   +0xD4  command index        liteExec: mov [edi+0D4h], eax
+//   0xD8   record stride        liteExec: imul edi, 0D8h
 constexpr size_t kCmdDataIndexOffset = 0xD4;
 
 typedef void(__thiscall* Fn_CmdMessage)(void* pThis, void* cmdData, const char* arg);
@@ -2555,7 +2656,8 @@ static void __fastcall CmdMessage_Hook(void* pThis, void* edx, void* cmdData, co
         ? *(int*)((char*)cmdData + kCmdDataIndexOffset)
         : -1;
     g_origCmdMessage(pThis, cmdData, arg);
-    t_cmdIndex = prev;   // restore: say() is also reached from other paths
+    t_cmdIndex = prev;   // Restore: say() is also reachable from paths that
+                         // never pass through cmdMessage.
 }
 
 //=============================================================================
@@ -2622,7 +2724,8 @@ static void __fastcall AdvCharSay_Hook(
     // Translate message. t_cmdIndex is set by CmdMessage_Hook when this say()
     // came from a MESSAGE command, giving an exact (file, index) match instead
     // of a text match -- the only way to disambiguate lines whose text repeats.
-    std::string msgAsRendered;   // pre-conversion UTF-8; SJIS drops the accents
+    std::string msgAsRendered;   // UTF-8 translation, kept for logging; the
+                                 // Shift-JIS copy loses accented characters.
     if (message && *message) {
         std::string tlUtf8 = g_translationDB.FindMessageTranslation(
             message, CurrentSceneFile(), t_cmdIndex);
@@ -2631,8 +2734,9 @@ static void __fastcall AdvCharSay_Hook(
             CharRestore::Map lost;
             std::string sjis = Encoding::Utf8ToSjisTracked(tlUtf8.c_str(), lost);
             if (!sjis.empty()) {
-                // Translate only. printEx runs downstream of this and owns the
-                // wrapping, where the text box and its font are reachable.
+                // Translate only; do not wrap here. printEx runs later in
+                // this call chain and owns the wrapping, because it is the
+                // only hook that can reach the text box geometry and font.
                 CharRestore::Register(sjis, std::move(lost));
                 finalMsg = g_stringPool.Store(sjis);
             }
@@ -2672,7 +2776,8 @@ static Fn_PrintSub g_origPrintSub = nullptr;
 static char __fastcall PrintSub_Hook(void* pThis, void* edx, const char* str,
                                      void* printData, unsigned long flags)
 {
-    // Recurses, so save and restore rather than clear.
+    // printSub can recurse, so save and restore the thread-local state
+    // instead of clearing it.
     const void*      prevData = CharRestore::t_printData;
     const char*      prevStr  = CharRestore::t_str;
     CharRestore::Map prevMap;
@@ -2707,16 +2812,16 @@ static void __fastcall PrintEx_Hook(
     const char* finalMsg = message;
 
     if (message && *message) {
-        // say() runs upstream and has usually already substituted the English
-        // text, so a lookup here normally misses. Wrap whatever we are handed
-        // rather than only text translated at this level -- this is the only
-        // place with the text box and its font.
+        // By the time printEx runs, say() has usually already replaced the
+        // text with English, so the lookup below normally misses. Wrap
+        // whatever text arrives, translated or not: this is the only hook
+        // with access to the text box and its font.
         std::string sjis;
         CharRestore::Map lost;
 
-        // countMiss=false: say() already counted this line, and by here it has
-        // usually replaced the text with English, so this lookup misses on
-        // material that is in fact translated.
+        // countMiss=false: say() already counted this line, and the text
+        // here is usually already English, so a miss at this point does not
+        // mean the line is untranslated.
         std::string tlUtf8 = g_translationDB.FindMessageTranslation(
             message, CurrentSceneFile(), t_cmdIndex, /*countMiss=*/false);
         if (!tlUtf8.empty()) {
@@ -2733,8 +2838,9 @@ static void __fastcall PrintEx_Hook(
             finalMsg = g_stringPool.Store(wrapped);
         }
 
-        // Offsets were taken before wrapping; the engine walks the wrapped
-        // text, so register that form too.
+        // The recorded offsets refer to the unwrapped string, but the
+        // engine draws the wrapped string, so remap the offsets and
+        // register the wrapped form too.
         if (!lost.empty() && wrapped != sjis) {
             auto moved = CharRestore::Remap(sjis, wrapped, lost);
             if (moved.size() == lost.size()) {
@@ -2763,8 +2869,9 @@ static void __fastcall PrintEx_Hook(
 //           hitwait()          <- input wait; backlog UI runs here
 //             prevHistory -> drawHistory -> printEx
 //
-// That last printEx is still inside cmdMessage, so t_cmdIndex is the live line's
-// index and rewinding showed the current message for every entry.
+// The final printEx runs while still inside cmdMessage, so t_cmdIndex holds
+// the live line's index. Before this hook, opening the backlog displayed
+// the current message for every entry.
 typedef void(__thiscall* Fn_DrawHistory)(void* pThis, void* container);
 static Fn_DrawHistory g_origDrawHistory = nullptr;
 
@@ -2921,7 +3028,9 @@ static char __fastcall LiteLoad_Hook(void* pThis, void* edx, const char* path, u
     {
         std::lock_guard<std::mutex> lock(DebugJump::g_mutex);
         if (DebugJump::g_jumpRequested && !DebugJump::g_pendingScene.empty()) {
-            // Replace with jump target (keep same format: "scenename.rld")
+            // Replace the path with the jump target. The engine always
+            // passes liteLoad a decorated path of the form rld\<name>.rld,
+            // so build the same form.
             overridePath = "rld\\" + DebugJump::g_pendingScene + ".rld";
             finalPath = overridePath.c_str();
 
@@ -2999,7 +3108,8 @@ static void WINAPI OutputDebugStringA_Hook(LPCSTR lpOutputString) {
         if (isOverflowWarning && Config::warnOnOverflow && !DebugJump::g_debugModeActive) {
             std::string scene = CurrentSceneFile();
             if (scene.empty()) scene = "?";
-            // The engine re-emits this per repaint; Log() flushes every call.
+            // The engine emits this warning on every repaint, and Log()
+            // flushes on every call, so report each overflow only once.
             if (WordWrap::ClaimOverflowReport("engine:" + scene + ":" +
                                               std::to_string(t_cmdIndex))) {
                 // The engine emits SJIS; the log is UTF-8.
@@ -3028,9 +3138,11 @@ static void WINAPI OutputDebugStringA_Hook(LPCSTR lpOutputString) {
 //=============================================================================
 // textOut renderer detection (both are named gdi32 imports)
 //=============================================================================
-// Both renderers open by measuring " " then the fullwidth space - the only two
-// characters they never rasterize. The pair runs once per call, which is what
-// re-bases each outline pass.
+// Detects the start of a textOut renderer call. Both renderers begin by
+// measuring the ASCII space and then the fullwidth space (0x8140); those
+// are the only two characters they measure but never rasterize. The pair
+// occurs once per renderer call, so arming on it resets fragment tracking
+// for each pass over the text (including the outline pass).
 typedef BOOL(WINAPI* Fn_GetTextExtentPoint32A)(HDC, LPCSTR, int, LPSIZE);
 static Fn_GetTextExtentPoint32A g_origGetTextExtentPoint32A = nullptr;
 
@@ -3054,8 +3166,10 @@ static BOOL WINAPI GetTextExtentPoint32A_Hook(HDC hdc, LPCSTR lpString, int c, L
     return g_origGetTextExtentPoint32A(hdc, lpString, c, psizl);
 }
 
-// Called by the two renderers and by the glyph loop's metrics helper. Only the
-// former arrives armed with the walk not yet started; anything else is stale.
+// GetOutlineTextMetricsA is called by the two textOut renderers and by the
+// glyph loop's metrics helper. A renderer call arrives with tracking armed
+// and no fragment base set yet; any other combination is stale state from
+// an earlier call, so clear it.
 typedef UINT(WINAPI* Fn_GetOutlineTextMetricsA)(HDC, UINT, LPOUTLINETEXTMETRICA);
 static Fn_GetOutlineTextMetricsA g_origGetOutlineTextMetricsA = nullptr;
 
@@ -3067,18 +3181,24 @@ static UINT WINAPI GetOutlineTextMetricsA_Hook(HDC hdc, UINT cjCopy, LPOUTLINETE
 //=============================================================================
 // Japanese fallback for a Latin-only custom face
 //=============================================================================
-// A Latin-only face keeps its name at DEFAULT_CHARSET but has no Japanese
-// glyphs, so untranslated lines would rasterize as notdef boxes. Those requests
-// go to a Gothic face of the same metrics instead. Keyed on metrics, not on the
-// engine's HFONT: the engine rebuilds its fonts freely and a handle-keyed table
-// would dangle unless it shadowed every DeleteObject.
+// Provides Japanese glyphs when the custom font is Latin-only.
+//
+// With DEFAULT_CHARSET, GDI honors a Latin-only face, but that face has no
+// Japanese glyphs, so untranslated lines would render as .notdef boxes.
+// This namespace redirects those glyph requests to a Gothic face with the
+// same height, weight, and italic setting.
+//
+// The fallback cache is keyed on those metrics, not on the engine's HFONT:
+// the engine creates and deletes fonts freely, and a handle-keyed table
+// would dangle unless every DeleteObject call were also hooked.
 namespace JpFallback {
     static std::mutex g_mutex;
     static std::unordered_map<uint64_t, HFONT> g_fonts;
     static std::unordered_map<uint64_t, bool>  g_missing;   // (HFONT, wchar) -> absent
 
-    // Can't pick by pitch: the engine hardcodes FIXED_PITCH everywhere and puts
-    // proportionality in the face name, which we have already overwritten.
+    // The proportional/fixed choice cannot be read from lfPitchAndFamily:
+    // the engine hardcodes FIXED_PITCH and encodes proportionality in the
+    // face name, which ApplyFontSubstitution has already overwritten.
     static HFONT FontFor(const LOGFONTA& lf) {
         const uint64_t key = ((uint64_t)(uint32_t)lf.lfHeight << 32)
                            | ((uint64_t)(uint16_t)lf.lfWeight << 16)
@@ -3118,19 +3238,19 @@ namespace JpFallback {
         return FontFor(lf);
     }
 
-    // Same, for a restored character the custom face may simply not carry.
-    // Without this a face missing one glyph rasterizes a notdef box and says
-    // nothing about it.
+    // Fallback for a restored character that the custom face does not
+    // contain. Without this check, a face missing a single glyph draws a
+    // .notdef box with no diagnostic.
     static HFONT ForMissingGlyph(HDC hdc, wchar_t wc) {
         if (!FontProbe::g_relaxed.load(std::memory_order_relaxed)) return nullptr;
 
         HFONT cur = (HFONT)GetCurrentObject(hdc, OBJ_FONT);
         if (!cur) return nullptr;
 
-        // Both outcomes have to short-circuit: a missing character comes back on
-        // every redraw, and the textOut renderer repeats each fragment for the
-        // outline pass, so caching only the hit would leave the miss querying
-        // GDI per glyph per pass.
+        // Cache both outcomes. A missing character recurs on every redraw,
+        // and the textOut renderer repeats each fragment for the outline
+        // pass; if only one outcome were cached, the other would query GDI
+        // once per glyph per pass.
         const uint64_t key = ((uint64_t)(uintptr_t)cur << 32) | (uint64_t)wc;
         bool absent = false;
         bool known  = false;
@@ -3165,9 +3285,10 @@ namespace JpFallback {
         return FontFor(lf);
     }
 
-    // g_missing is keyed on HFONT, and GDI reuses handle values; a recycled one
-    // would carry the old face's answer. g_fonts is keyed on metrics and holds
-    // our own handles, so it stays.
+    // g_missing is keyed on HFONT, and GDI reuses handle values, so a
+    // recycled handle would inherit the previous face's answers; clear
+    // them. g_fonts is keyed on metrics and holds handles we created
+    // ourselves, so it is unaffected.
     static void InvalidateForFont(HFONT hf) {
         if (!hf) return;
         const uint64_t prefix = (uint64_t)(uintptr_t)hf << 32;
@@ -3204,15 +3325,18 @@ static DWORD WINAPI GetGlyphOutlineA_Hook(
     LPVOID pvBuffer, const MAT2* lpmat2)
 {
     DWORD result;
-    // One or the other, never a fallback chain: inside a renderer walk the
-    // UxPrintData cursor is frozen where the last glyph loop left it.
+    // Choose exactly one source for the substitute character; never try one
+    // and fall back to the other. During a textOut renderer walk, the
+    // UxPrintData cursor still holds the position where the last glyph loop
+    // stopped, so consulting it there would substitute the wrong character.
     wchar_t sub = (CharRestore::t_toArmed && CharRestore::t_toBase)
                 ? CharRestore::CharAtTextOut(uChar)
                 : CharRestore::CharAtCursor();
     if (wchar_t wc = sub) {
-        // Deliberately the DC's own font: restored characters are the Latin
-        // ones SJIS dropped, and the custom face is what should draw them --
-        // unless it has no such glyph.
+        // Use the DC's current font on purpose: restored characters are the
+        // Latin ones Shift-JIS dropped, and the custom face should draw
+        // them - unless it has no such glyph, in which case use the
+        // fallback face.
         if (HFONT fb = JpFallback::ForMissingGlyph(hdc, wc)) {
             HGDIOBJ prev = SelectObject(hdc, fb);
             result = GetGlyphOutlineW(hdc, (UINT)wc, fuFormat, lpgm, cjBuffer, pvBuffer, lpmat2);
@@ -3230,9 +3354,14 @@ static DWORD WINAPI GetGlyphOutlineA_Hook(
         result = g_origGetGlyphOutlineA(hdc, uChar, fuFormat, lpgm, cjBuffer, pvBuffer, lpmat2);
     }
 
-    // gmCellIncX must move with the clamp: clamping alone shifts the overlap
-    // onto the next glyph. Ungated - the metrics path (0x10175390) passes no
-    // buffer, and gating on that made it disagree with the renderer.
+    // Fix negative left-side bearings. The engine draws each glyph at the
+    // pen position, so a negative gmptGlyphOrigin.x makes the glyph overlap
+    // the previous one. Clamp the origin to 0 and add the difference to
+    // gmCellIncX so the total advance is unchanged; clamping alone would
+    // move the overlap onto the next glyph. Apply this on every call,
+    // including measurement-only calls with no buffer (the metrics path at
+    // 0x10175390): gating on the buffer made measured widths disagree with
+    // rendered widths.
     if (lpgm && result != GDI_ERROR) {
         if (lpgm->gmptGlyphOrigin.x < 0) {
             int offset = -lpgm->gmptGlyphOrigin.x;
@@ -3264,9 +3393,10 @@ static HFONT WINAPI CreateFontIndirectA_Hook(const LOGFONTA* lf) {
 
         HFONT created = g_origCreateFontIndirectA(&modified);
 
-        // Advances are cached per HFONT; a recycled handle would inherit the old
-        // font's widths. Targeted rather than a full flush - fonts are recreated
-        // often enough that flushing everything would defeat the cache.
+        // The glyph cache is keyed by HFONT, and GDI can return a handle
+        // value it used before, so drop any cached entries for this handle.
+        // Invalidate only this handle: the engine recreates fonts often,
+        // and flushing the whole cache each time would make it useless.
         WordWrap::InvalidateGlyphsForFont(created);
         JpFallback::InvalidateForFont(created);
 
@@ -3328,8 +3458,9 @@ public:
         m_onChange = onChange;
         m_running = true;
 
-        // Not on the thread: Stop() can win that race and leave the watch in an
-        // INFINITE wait with nothing to signal it.
+        // Create the stop event on this thread, not the watcher thread. If
+        // Stop() ran before the watcher thread created the event, SetEvent
+        // would have nothing to signal and the watch would wait forever.
         m_stopEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
         if (!m_stopEvent) {
             Log("[FileWatcher] CreateEvent failed for %s (error %lu)\n",
@@ -3350,8 +3481,10 @@ public:
         return true;
     }
 
-    // False means the thread outlived the wait and may still be inside a
-    // reload, using m_spec/m_onChange - the caller must leak, not destroy.
+    // Returns false if the thread did not exit within the timeout. The
+    // thread may then still be inside a reload, reading m_spec and
+    // m_onChange, so the caller must leak this object rather than destroy
+    // it.
     bool Stop() {
         m_running = false;
         if (m_stopEvent) SetEvent(m_stopEvent);
@@ -3405,13 +3538,16 @@ private:
 
         unsigned long long entry = t.QuadPart ^
                                    (((unsigned long long)sizeHigh << 32) | sizeLow);
-        // Not tolower(): UB on an SJIS lead byte, and locale-dependent.
+        // Do not use tolower(): it is undefined behavior for bytes outside
+        // 0..127 (such as an SJIS lead byte) and depends on the C locale.
+        // Fold ASCII case manually.
         for (const char* p = name; *p; ++p) {
             unsigned char c = (unsigned char)*p;
             if (c >= 'A' && c <= 'Z') c = (unsigned char)(c - 'A' + 'a');
             entry = (entry ^ c) * 1099511628211ULL;
         }
-        fp.hash += entry;   // order-independent, so directory order cannot matter
+        fp.hash += entry;   // Sum, so the result does not depend on
+                            // directory enumeration order.
         fp.count++;
     }
 
@@ -3505,8 +3641,9 @@ private:
         int namesLogged = 0;
         constexpr int kMaxNamesPerWindow = 5;
 
-        // Only a matching change may move the deadline; rescheduling on every
-        // completion lets unrelated churn postpone a real reload indefinitely.
+        // Only a change to a watched file may move the deadline. If every
+        // notification rescheduled the debounce, unrelated activity in the
+        // directory could postpone a pending reload indefinitely.
         auto schedule = [&]() {
             pending = true;
             deadline = GetTickCount64() + Constants::kFileWatcherDebounceMs;
@@ -3516,8 +3653,11 @@ private:
 
         bool saidSuppressed = false;
 
-        // hook.log sits in tl\ and is flushed per line, so an unconditional
-        // reload here would feed its own watcher.
+        // Overflow handling must not reload unconditionally: hook.log lives
+        // in tl\ and is flushed on every line, so a reload that logs would
+        // generate more changes and re-trigger this watcher in a loop.
+        // Compare fingerprints and reload only if a watched file actually
+        // changed.
         auto scheduleIfChanged = [&]() {
             Fingerprint now = Snapshot();
             if (now != seen) {
@@ -3550,12 +3690,14 @@ private:
                 armed = true;
             }
 
-            // Read once: two samples let the deadline pass between them, and
-            // deadline - now then wraps to ~49 days or exactly INFINITE.
+            // Read the clock once. With two reads, the deadline could pass
+            // between them, and (deadline - now) would underflow to roughly
+            // 49 days, or exactly INFINITE.
             ULONGLONG now = GetTickCount64();
 
-            // Reloads with the request still armed: edits during the reload land
-            // in the kernel's buffer instead of being missed.
+            // Fire while the ReadDirectoryChangesW request is still armed,
+            // so edits made during the reload accumulate in the kernel's
+            // buffer instead of being lost.
             if (pending && now >= deadline) {
                 pending = false;
                 namesLogged = 0;
@@ -3598,8 +3740,9 @@ private:
                 std::string changed;
                 while (true) {
                     std::wstring changedW(info->FileName, info->FileNameLength / sizeof(WCHAR));
-                    // Sized from the conversion, not MAX_PATH: a name whose
-                    // CP932 form is longer would otherwise be dropped silently.
+                    // Size the buffer from the conversion result, not
+                    // MAX_PATH: a name whose CP932 form is longer would
+                    // otherwise be dropped silently.
                     int need = WideCharToMultiByte(CP_ACP, 0, changedW.c_str(), -1,
                                                    nullptr, 0, nullptr, nullptr);
                     changed.assign(need > 0 ? (size_t)need : 0, '\0');
@@ -3623,8 +3766,10 @@ private:
                     info = (FILE_NOTIFY_INFORMATION*)((char*)info + info->NextEntryOffset);
                 }
 
-                // Or an overflow before the deadline keeps seeing this same edit
-                // and pushing the reload out.
+                // Refresh the fingerprint now. Otherwise an overflow
+                // arriving before the deadline would compare against the
+                // pre-edit fingerprint, treat this same edit as new, and
+                // push the reload out again.
                 if (matched) seen = Snapshot();
             } else if (waitResult == WAIT_FAILED) {
                 Log("[FileWatcher] WaitForMultipleObjects failed on %s (error %lu)"
@@ -3653,14 +3798,16 @@ private:
     HANDLE m_stopEvent = nullptr;
 };
 
-// char_table.tsv is left out on purpose: g_charIdToName has no mutex and is read
-// from the render path, so reloading it would race.
+// char_table.tsv is intentionally not watched: g_charIdToName has no mutex
+// and is read from the render path, so reloading it at runtime would be a
+// data race.
 static std::vector<std::unique_ptr<FileWatcher>> g_fileWatchers;
 
 static std::string DirNameOf(const std::string& path) {
     size_t slash = path.find_last_of("\\/");
     if (slash == std::string::npos) return ".";
-    // "C:\file" -> "C:\", not "C:" -- those name different places to Win32.
+    // For "C:\file", return "C:\", not "C:". To Win32 those are different
+    // places: "C:\" is the root, "C:" is the drive's current directory.
     if (slash == 2 && path.size() >= 3 && path[1] == ':') return path.substr(0, 3);
     if (slash == 0) return path.substr(0, 1);
     return path.substr(0, slash);
@@ -3689,9 +3836,10 @@ static std::string FullPathOf(const std::string& path) {
 static size_t StartTranslationWatchers(std::function<void()> onChange) {
     std::vector<FileWatcher::Spec> specs;
 
-    // Per directory, not by basename: a same-named file under another root must
-    // stay watched. char_table.tsv is here for ScriptsDir=.\tl, where anyTsv
-    // would otherwise match it.
+    // Exclusions match directory and file name together, not name alone: a
+    // file with the same name in a different directory must stay watched.
+    // char_table.tsv is listed for the case ScriptsDir=.\tl, where the
+    // *.tsv wildcard would otherwise match it.
     struct Exclusion { std::string dir, base; };
     Exclusion exclusions[2];
     {
@@ -3717,8 +3865,9 @@ static size_t StartTranslationWatchers(std::function<void()> onChange) {
         specs.push_back(std::move(s));
     };
 
-    // Never a subtree watch: TranslationDB::ListTsvFiles globs one level, so a
-    // nested TSV would trigger a reload that cannot read it.
+    // Watch a single directory, never a subtree: TranslationDB's
+    // ListTsvFiles scans one level only, so a change in a nested TSV would
+    // trigger a reload that cannot see the file.
     if (Config::scriptsDir[0]) {
         FileWatcher::Spec s;
         s.directory = FullPathOf(Config::scriptsDir);
@@ -3793,7 +3942,9 @@ static Fn_CharPrevA g_origCharPrevA = nullptr;
 
 static LPSTR WINAPI CharPrevA_Hook(LPCSTR lpszStart, LPCSTR lpszCurrent) {
     if (lpszCurrent <= lpszStart)
-        return (LPSTR)lpszStart;LPCSTR p = lpszCurrent - 1;
+        return (LPSTR)lpszStart;
+
+    LPCSTR p = lpszCurrent - 1;
 
     // Check if we're in the middle of a 2-byte SJIS char
     if (p > lpszStart) {
@@ -3828,7 +3979,7 @@ static LPSTR WINAPI CharNextA_Hook(LPCSTR lpsz) {
 
     unsigned char c = *(unsigned char*)lpsz;
 
-    // SJIS lead byte - skip2 bytes
+    // SJIS lead byte - skip 2 bytes
     if ((c >= 0x81 && c <= 0x9F) || (c >= 0xE0 && c <= 0xFC)) {
         if (lpsz[1])
             return (LPSTR)(lpsz + 2);
@@ -3842,7 +3993,7 @@ typedef UINT(WINAPI* Fn_GetACP)();
 static Fn_GetACP g_origGetACP = nullptr;
 
 static UINT WINAPI GetACP_Hook() {
-    return 932;// Japanese Shift-JIS
+    return 932;   // Japanese Shift-JIS
 }
 
 typedef UINT(WINAPI* Fn_GetOEMCP)();
@@ -4225,8 +4376,9 @@ static INT_PTR WINAPI DialogBoxParamA_Hook(
     return result;
 }
 
-// Translate if we can, then widen: UTF-8 straight from the TSV on a hit, CP932
-// on a miss. Returns false when there is nothing to show.
+// Converts UI text to UTF-16, translating when possible. On a translation
+// hit the source is the TSV's UTF-8; on a miss it is the original CP932
+// text. Returns false when there is no text to show.
 static bool UiTextToWide(LPCSTR sjis, std::wstring& out, bool* translated = nullptr) {
     if (translated) *translated = false;
     if (!sjis || !*sjis) return false;
@@ -4236,7 +4388,8 @@ static bool UiTextToWide(LPCSTR sjis, std::wstring& out, bool* translated = null
     UINT cp         = tl.empty() ? 932u : CP_UTF8;
     const char* src = tl.empty() ? sjis : tl.c_str();
 
-    // Explicit codepages, so MultiByteToWideChar_Hook passes them through.
+    // Explicit code pages, so MultiByteToWideChar_Hook passes them through
+    // (it rewrites only the locale-relative values).
     int n = MultiByteToWideChar(cp, 0, src, -1, nullptr, 0);
     if (n <= 0) return false;
     out.resize(n);
@@ -4245,10 +4398,12 @@ static bool UiTextToWide(LPCSTR sjis, std::wstring& out, bool* translated = null
     return true;
 }
 
-// Startup/environment errors bypass DialogBoxParamA and call MessageBoxA.
-// Widen here and call W: MessageBoxA converts through the process ACP in
-// ntdll's NLS tables, which neither the MultiByteToWideChar nor the GetACP
-// hook reaches -- SJIS bytes would be read as CP1252 on a Western system.
+// Startup and environment errors call MessageBoxA directly, bypassing
+// DialogBoxParamA. Convert the text ourselves and call MessageBoxW:
+// MessageBoxA's own ANSI conversion uses the process ACP through ntdll's
+// internal NLS tables, which neither the MultiByteToWideChar hook nor the
+// GetACP hook intercepts. On a Western system, the Shift-JIS bytes would be
+// decoded as Windows-1252.
 typedef int(WINAPI* Fn_MessageBoxA)(HWND, LPCSTR, LPCSTR, UINT);
 static Fn_MessageBoxA g_origMessageBoxA = nullptr;
 
@@ -4270,7 +4425,10 @@ static BOOL WINAPI SetDlgItemTextA_Hook(HWND hDlg, int nIDDlgItem, LPCSTR lpStri
     std::wstring wide;
     bool translated = false;
     if (UiTextToWide(lpString, wide, &translated)) {
-        // Untranslated text is still Japanese. An ANSI control converts it back.
+        // If there is no translation, the text is still Japanese. Sending
+        // UTF-16 to an ANSI window procedure would convert it back through
+        // the ACP and corrupt it, so use the W call only for translated
+        // text or Unicode windows.
         HWND item = GetDlgItem(hDlg, nIDDlgItem);
         if (item && (translated || IsWindowUnicode(item))) {
             return SetDlgItemTextW(hDlg, nIDDlgItem, wide.c_str());
@@ -4316,7 +4474,8 @@ static int WINAPI WideCharToMultiByte_Hook(UINT, DWORD, LPCWCH, int, LPSTR, int,
 static HWND WINAPI CreateWindowExA_Hook(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
 static BOOL WINAPI SetWindowTextA_Hook(HWND, LPCSTR);
 
-// Title hooks only; GameHasFocus deliberately does not use it.
+// Used only by the title hooks. GameHasFocus intentionally does not use it;
+// it checks the foreground window's process instead.
 static std::atomic<HWND> g_mainGameWindow{ nullptr };
 
 static BOOL CALLBACK FixEarlyWindowProc(HWND hwnd, LPARAM) {
@@ -4348,8 +4507,9 @@ static bool HookLocaleApi(const char* name, void* detour, void** original) {
     return false;
 }
 
-// Unhooked converter on purpose: our own hook forces CP_ACP to 932, which would
-// mojibake a path written in the machine's real ANSI codepage.
+// Deliberately uses the unhooked converter: our hook rewrites CP_ACP to
+// 932, but this path was produced by the machine's real ANSI code page, and
+// converting it as 932 would corrupt it.
 static std::wstring AnsiPathToWide(const char* s) {
     std::wstring out;
     if (!s || !*s) return out;
@@ -4385,7 +4545,8 @@ static bool Initialize() {
             " Harmless for the normal statically-imported install.\n");
     }
 
-    // what are we on
+    // Log the real system code page before the hooks change what GetACP
+    // returns.
     Log("[LOCALE] system ACP=%u\n", GetACP());
 
     // Call this before the first probe. FontProbe caches each face name.
@@ -4484,8 +4645,9 @@ static bool Initialize() {
         }
     }
 
-    // Before any hook is enabled: g_charIdToName has no mutex, and
-    // AdvCharSay_Hook reads it from the render thread.
+    // Load before any hook is enabled: g_charIdToName has no mutex, and
+    // AdvCharSay_Hook reads it from the game's render thread once hooks are
+    // live.
     LoadCharIdTable(Config::charIdFile);
 
     HMODULE hResident = GetModuleHandleA("resident.dll");
@@ -4499,7 +4661,7 @@ static bool Initialize() {
     // ok hooks
     MH_EnableHook(MH_ALL_HOOKS);
 
-    // fix win
+    // Retitle any windows the game created before the hooks were installed.
     EnumWindows(FixEarlyWindowProc, 0);
 
     InitConsole();
@@ -4543,7 +4705,8 @@ static bool Initialize() {
             " (ScriptsDir=%s, TranslationFile=%s)\n",
             Config::scriptsDir, Config::translationFile);
 
-        // A translator starts with empty TRANSLATION columns; don't box them.
+        // A translator starting from a fresh dump has all-empty TRANSLATION
+        // columns; don't show them a warning box on every launch.
         if (!Config::enableEditingTools) {
             std::wstring msg =
                 L"Translation files were found, but no dialogue translations "
@@ -4564,9 +4727,11 @@ static bool Initialize() {
     return true;
 }
 
-// Normally unreachable: pinned, statically imported, and process exit passes a
-// non-null lpReserved. Best-effort only - Stop() may time out and leave a
-// thread running, so dynamic unload is not supported.
+// Normally never runs: the module pins itself, the proxy is statically
+// imported, and at process exit DllMain receives a non-null lpReserved,
+// which skips this call. Treat it as best effort; FileWatcher::Stop can
+// time out and leave a thread running, so dynamically unloading this DLL is
+// not supported.
 static void Shutdown() {
     g_running = false;
     StopTranslationWatchers();
@@ -4604,8 +4769,8 @@ static void Shutdown() {
 // Codepage Hook Functions
 //=============================================================================
 
-// CP_ACP(0), CP_OEMCP(1), CP_MACCP(2) and CP_THREAD_ACP(3) all resolve against
-// the current locale instead of naming a codepage outright.
+// These four values are placeholders that resolve to a code page from the
+// current locale settings; every other value names a code page directly.
 static inline bool IsLocaleRelativeCodePage(UINT cp) {
     return cp == CP_ACP || cp == CP_OEMCP || cp == CP_MACCP || cp == CP_THREAD_ACP;
 }
@@ -4714,8 +4879,10 @@ static BOOL WINAPI SetWindowTextA_Hook(HWND hWnd, LPCSTR lpString)
     }
 
     if (lpString) {
-        // Dialog captions arrive here from WM_INITDIALOG (0x417E80). They are
-        // not children, so the DialogBoxParamA CBT pass never sees them.
+        // Dialog captions are set here during WM_INITDIALOG (engine code at
+        // 0x417E80). The caption belongs to the dialog window itself, not a
+        // child control, so the EnumChildWindows pass in DialogBoxParamA_Hook
+        // never reaches it.
         std::wstring wide;
         if (UiTextToWide(lpString, wide)) {
             DefWindowProcW(hWnd, WM_SETTEXT, 0, (LPARAM)wide.c_str());
@@ -4737,14 +4904,18 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
     switch (reason) {
     case DLL_PROCESS_ATTACH: {
         DisableThreadLibraryCalls(hModule);
-        // Worker threads can't be joined under the loader lock. Never fail on
-        // this: returning FALSE would kill the game at process init.
+        // Pin this module so it can never be unloaded: the worker threads
+        // cannot be joined while the loader lock is held, so unloading
+        // would free code that is still running. If pinning fails, continue
+        // anyway; returning FALSE from DLL_PROCESS_ATTACH would abort the
+        // game's startup.
         {
             HMODULE pin = nullptr;
             if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN |
                                     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                                     (LPCWSTR)&DllMain, &pin)) {
-                // Only channel alive this early; repeated to hook.log later.
+                // OutputDebugString is the only logging available this
+                // early; Initialize() repeats the warning to hook.log.
                 OutputDebugStringA("[YotsuiroHook] module pin failed; "
                                    "unload would be unsafe\n");
                 g_modulePinFailed.store(true);
