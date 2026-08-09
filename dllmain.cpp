@@ -1,4 +1,4 @@
-#define WIN32_LEAN_AND_MEAN
+﻿#define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <cstdio>
 #include <cstdint>
@@ -155,6 +155,8 @@ namespace Config {
     char fontNameProportional[64] = "";
     // Used for Japanese glyphs when the custom face has no Shift-JIS charset
     char fontFallbackJp[64] = "";
+    // Custom font folder, loaded private to this process
+    char fontDir[MAX_PATH] = ".\\tl\\fonts\\";
 
     // Asset redirection
     bool enableAssetRedirect = true;
@@ -235,6 +237,9 @@ static void SaveDefaultConfig() {
     fprintf(f, "; Japanese glyphs when the font above is Latin-only\n");
     fprintf(f, "; (untranslated lines, unmapped names). Empty=MS Gothic\n");
     fprintf(f, "FallbackJapanese=\n");
+    fprintf(f, "\n");
+    fprintf(f, "; Custom font folder (empty=disable)\n");
+    fprintf(f, "Dir=.\\tl\\fonts\\\n");
     fprintf(f, "\n");
 
     fprintf(f, "[Files]\n");
@@ -388,6 +393,7 @@ static void LoadConfig() {
     ReadStringEnsure("Font", "Name", "", Config::fontName, sizeof(Config::fontName));
     ReadStringEnsure("Font", "NameProportional", "", Config::fontNameProportional, sizeof(Config::fontNameProportional));
     ReadStringEnsure("Font", "FallbackJapanese", "", Config::fontFallbackJp, sizeof(Config::fontFallbackJp));
+    ReadStringEnsure("Font", "Dir", ".\\tl\\fonts\\", Config::fontDir, sizeof(Config::fontDir));
 
     // Files
     ReadStringEnsure("Files", "TranslationFile", Config::kDefaultTranslationFile, Config::translationFile, sizeof(Config::translationFile));
@@ -1595,6 +1601,58 @@ typedef HFONT(WINAPI* Fn_CreateFontIndirectA)(const LOGFONTA*);
 static Fn_CreateFontIndirectA g_origCreateFontIndirectA = nullptr;
 
 //=============================================================================
+// Bundled fonts
+//=============================================================================
+// Wine renders a face that comes from a FontSubstitutes alias, but it does not
+// enumerate one. The probe below therefore does not find it.
+static std::vector<std::pair<std::wstring, DWORD>> g_bundledFonts;
+
+static void LoadBundledFonts() {
+    if (Config::fontDir[0] == '\0') return;
+
+    wchar_t dir[MAX_PATH];
+    if (MultiByteToWideChar(932, 0, Config::fontDir, -1, dir, MAX_PATH) == 0) return;
+
+    std::wstring base(dir);
+    if (base.back() != L'\\' && base.back() != L'/') base += L'\\';
+
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((base + L"*.*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const wchar_t* ext = wcsrchr(fd.cFileName, L'.');
+        if (!ext) continue;
+        if (_wcsicmp(ext, L".ttf") && _wcsicmp(ext, L".otf") &&
+            _wcsicmp(ext, L".ttc") && _wcsicmp(ext, L".fon")) continue;
+
+        std::wstring path = base + fd.cFileName;
+
+        // Older Wine does not enumerate FR_PRIVATE faces.
+        DWORD flags = FR_PRIVATE;
+        int added = AddFontResourceExW(path.c_str(), flags, nullptr);
+        if (!added) {
+            flags = 0;
+            added = AddFontResourceExW(path.c_str(), flags, nullptr);
+        }
+
+        Log("[FONT] bundled %ls: %s%s\n", fd.cFileName,
+            added ? "loaded" : "FAILED", (added && !flags) ? " (shared)" : "");
+
+        if (added) g_bundledFonts.emplace_back(std::move(path), flags);
+    } while (FindNextFileW(h, &fd));
+
+    FindClose(h);
+}
+
+static void UnloadBundledFonts() {
+    for (const auto& f : g_bundledFonts)
+        RemoveFontResourceExW(f.first.c_str(), f.second, nullptr);
+    g_bundledFonts.clear();
+}
+
+//=============================================================================
 // Font capability probe
 //=============================================================================
 // Asking for a Latin-only face at SHIFTJIS_CHARSET doesn't fail - GDI drops the
@@ -1693,11 +1751,9 @@ static void ApplyFontSubstitution(LOGFONTA& lf) {
     FontProbe::Info info = FontProbe::Query(lf.lfFaceName);
     lf.lfCharSet = info.sjis ? SHIFTJIS_CHARSET : DEFAULT_CHARSET;
 
-    if (custom) {
-        FontProbe::ReportOnce(lf.lfFaceName, info);
-        if (info.installed && !info.sjis)
-            FontProbe::g_relaxed.store(true, std::memory_order_relaxed);
-    }
+    FontProbe::ReportOnce(lf.lfFaceName, info);
+    if (custom && info.installed && !info.sjis)
+        FontProbe::g_relaxed.store(true, std::memory_order_relaxed);
 }
 
 // True while WordWrap measures a glyph of its own; see GlyphAdvance.
@@ -4171,10 +4227,12 @@ static INT_PTR WINAPI DialogBoxParamA_Hook(
 
 // Translate if we can, then widen: UTF-8 straight from the TSV on a hit, CP932
 // on a miss. Returns false when there is nothing to show.
-static bool UiTextToWide(LPCSTR sjis, std::wstring& out) {
+static bool UiTextToWide(LPCSTR sjis, std::wstring& out, bool* translated = nullptr) {
+    if (translated) *translated = false;
     if (!sjis || !*sjis) return false;
 
     std::string tl = g_translationDB.FindUITranslation(sjis);
+    if (translated) *translated = !tl.empty();
     UINT cp         = tl.empty() ? 932u : CP_UTF8;
     const char* src = tl.empty() ? sjis : tl.c_str();
 
@@ -4202,6 +4260,23 @@ static int WINAPI MessageBoxA_Hook(HWND hWnd, LPCSTR lpText, LPCSTR lpCaption, U
                        haveText    ? wText.c_str()    : nullptr,
                        haveCaption ? wCaption.c_str() : nullptr,
                        uType);
+}
+
+// Dialog bodies and buttons take that same ACP path through SetDlgItemTextA.
+typedef BOOL(WINAPI* Fn_SetDlgItemTextA)(HWND, int, LPCSTR);
+static Fn_SetDlgItemTextA g_origSetDlgItemTextA = nullptr;
+
+static BOOL WINAPI SetDlgItemTextA_Hook(HWND hDlg, int nIDDlgItem, LPCSTR lpString) {
+    std::wstring wide;
+    bool translated = false;
+    if (UiTextToWide(lpString, wide, &translated)) {
+        // Untranslated text is still Japanese. An ANSI control converts it back.
+        HWND item = GetDlgItem(hDlg, nIDDlgItem);
+        if (item && (translated || IsWindowUnicode(item))) {
+            return SetDlgItemTextW(hDlg, nIDDlgItem, wide.c_str());
+        }
+    }
+    return g_origSetDlgItemTextA(hDlg, nIDDlgItem, lpString);
 }
 
 static HMODULE WINAPI LoadLibraryExA_Hook(LPCSTR lpLibFileName, HANDLE hFile, DWORD dwFlags) {
@@ -4313,6 +4388,9 @@ static bool Initialize() {
     // what are we on
     Log("[LOCALE] system ACP=%u\n", GetACP());
 
+    // Call this before the first probe. FontProbe caches each face name.
+    LoadBundledFonts();
+
     if (MH_Initialize() != MH_OK) {
         MessageBoxA(nullptr, "MinHook initialization failed.\nTranslation hook is disabled.",
                     "Translation Hook", MB_ICONERROR | MB_OK);
@@ -4345,6 +4423,14 @@ static bool Initialize() {
     if (MH_CreateHookApi(L"user32", "MessageBoxA",
         (void*)&MessageBoxA_Hook, (void**)&g_origMessageBoxA) == MH_OK) {
         Log("[DIALOG] MessageBoxA hooked (startup/error dialogs)\n");
+    }
+    if (MH_CreateHookApi(L"user32", "SetDlgItemTextA",
+        (void*)&SetDlgItemTextA_Hook, (void**)&g_origSetDlgItemTextA) == MH_OK) {
+        Log("[DIALOG] SetDlgItemTextA hooked (dialog body + buttons)\n");
+    }
+    else {
+        Log("[!] DIALOG: SetDlgItemTextA hook failed - dialog body and buttons"
+            " stay untranslated\n");
     }
     if (MH_CreateHookApi(L"kernel32", "GetACP",
         (void*)&GetACP_Hook, (void**)&g_origGetACP) == MH_OK) {
@@ -4498,6 +4584,7 @@ static void Shutdown() {
     MH_Uninitialize();
     WordWrap::ReleaseMeasureDC();
     JpFallback::Release();
+    UnloadBundledFonts();
 
     if (g_logFile) {
         std::lock_guard<std::mutex> lock(g_logMutex);
