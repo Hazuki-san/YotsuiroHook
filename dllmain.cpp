@@ -13,7 +13,8 @@
 #include <algorithm>
 #include <functional>
 #include <atomic>
-#include <chrono> 
+#include <memory>
+#include <chrono>
 #include <MinHook.h>
 #include <discord_rpc.h>
 #include "proxy.h"
@@ -100,7 +101,8 @@ namespace Constants {
     constexpr int kMaxLabelSuffixSearch = 30;
     constexpr int kMaxSearchResults = 20;
     constexpr DWORD kHotkeyPollIntervalMs = 50;
-    constexpr DWORD kFileWatcherDebounceMs = 100;
+    constexpr DWORD kFileWatcherDebounceMs = 400;
+    constexpr DWORD kWatcherStopTimeoutMs = 2000;
     constexpr int kMaxMissedTextsToShow = 15;
 }
 
@@ -115,6 +117,7 @@ namespace Config {
     constexpr const char* kDefaultTlAssetsPath = ".\\tl\\assets\\";
     constexpr const char* kDefaultScriptsDir = ".\\tl\\scripts";
     constexpr const char* kDefaultUiFile = ".\\tl\\ui.tsv";
+    constexpr const char* kDefaultUntranslatedLog = ".\\tl\\untranslated.tsv";
 
     // Runtime file paths
     char translationFile[MAX_PATH] = ".\\tl\\translation.tsv";
@@ -127,11 +130,12 @@ namespace Config {
 
     // General
     char windowTitle[256] = "";
-    bool enableConsole = true;
-    bool enableTextLogging = true;
+    bool enableConsole = false;
+    std::atomic<bool> enableTextLogging{false};
     char logFile[MAX_PATH] = ".\\tl\\hook.log";   // empty = disable
     bool dumpUntranslated = false;
     bool enableDiscordPresence = true;
+    bool enableEditingTools = false;
 
     // Text
     enum class WrapMode { Off, Chars, Pixel };
@@ -180,8 +184,12 @@ static void SaveDefaultConfig() {
     fprintf(f, "; Show debug console window\n");
     fprintf(f, "EnableConsole=false\n");
     fprintf(f, "\n");
-    fprintf(f, "; Log text to console\n");
-    fprintf(f, "EnableTextLogging=true\n");
+    fprintf(f, "; Log every translated line to console and log file\n");
+    fprintf(f, "EnableTextLogging=false\n");
+    fprintf(f, "\n");
+    fprintf(f, "; Translator tools: F5 reload hotkey and the TSV file watcher.\n");
+    fprintf(f, "; Does not affect whether text is translated.\n");
+    fprintf(f, "EnableEditingTools=false\n");
     fprintf(f, "\n");
     fprintf(f, "; Write log to file (empty=disable)\n");
     fprintf(f, "LogFile=.\\tl\\hook.log\n");
@@ -241,6 +249,8 @@ static void SaveDefaultConfig() {
     fprintf(f, "CharIdFile=.\\tl\\char_table.tsv\n");
     fprintf(f, "; Engine UI strings from ExHIBIT.exe dialog resources + .rdata\n");
     fprintf(f, "UiFile=.\\tl\\ui.tsv\n");
+    fprintf(f, "; Where DumpUntranslated appends lines the game sent but no TSV covers\n");
+    fprintf(f, "UntranslatedLog=.\\tl\\untranslated.tsv\n");
     fprintf(f, "\n");
 
     fprintf(f, "[Assets]\n");
@@ -286,6 +296,47 @@ static void ReadString(const char* section, const char* key, const char* default
     GetPrivateProfileStringA(section, key, defaultVal, out, (DWORD)outSize, Config::configFile);
 }
 
+// SaveDefaultConfig only runs on a fresh file, so an existing INI never gains
+// keys added since.
+static std::vector<std::string> g_iniKeysAdded;
+static std::vector<std::string> g_iniKeysFailed;
+
+static bool IniKeyExists(const char* section, const char* key) {
+    char buf[8];
+    GetPrivateProfileStringA(section, key, "\x01", buf, sizeof(buf), Config::configFile);
+    return buf[0] != '\x01';
+}
+
+static void IniEnsure(const char* section, const char* key, const char* value) {
+    if (IniKeyExists(section, key)) return;
+    if (WritePrivateProfileStringA(section, key, value, Config::configFile)) {
+        g_iniKeysAdded.push_back(std::string(section) + "/" + key + "=" + value);
+    } else {
+        g_iniKeysFailed.push_back(std::string(section) + "/" + key +
+                                  " (error " + std::to_string(GetLastError()) + ")");
+    }
+}
+
+static bool ReadBoolEnsure(const char* section, const char* key, bool defaultVal) {
+    bool v = ReadBool(section, key, defaultVal);
+    IniEnsure(section, key, v ? "true" : "false");
+    return v;
+}
+
+static int ReadIntEnsure(const char* section, const char* key, int defaultVal) {
+    int v = ReadInt(section, key, defaultVal);
+    char buf[16];
+    _itoa_s(v, buf, 10);
+    IniEnsure(section, key, buf);
+    return v;
+}
+
+static void ReadStringEnsure(const char* section, const char* key, const char* defaultVal,
+                             char* out, size_t outSize) {
+    ReadString(section, key, defaultVal, out, outSize);
+    IniEnsure(section, key, out);
+}
+
 // Forward declaration for Log (defined later)
 static void Log(const char* fmt, ...);
 
@@ -297,7 +348,7 @@ namespace DebugJump {
     static std::string g_pendingScene;
     static bool g_jumpRequested = false;
     static void* g_retouchSystem = nullptr;
-    static bool g_debugModeActive = false;
+    static std::atomic<bool> g_debugModeActive{false};
 }
 
 static void LoadConfig() {
@@ -308,50 +359,52 @@ static void LoadConfig() {
     }
 
     // General
-    ReadString("General", "WindowTitle", "", Config::windowTitle, sizeof(Config::windowTitle));
-    Config::enableConsole = ReadBool("General", "EnableConsole", true);
-    Config::enableTextLogging = ReadBool("General", "EnableTextLogging", true);
-    ReadString("General", "LogFile", ".\\tl\\hook.log", Config::logFile, sizeof(Config::logFile));
-    Config::dumpUntranslated = ReadBool("General", "DumpUntranslated", false);
-    Config::enableDiscordPresence = ReadBool("General", "EnableDiscordPresence", true);
+    ReadStringEnsure("General", "WindowTitle", "", Config::windowTitle, sizeof(Config::windowTitle));
+    Config::enableConsole = ReadBoolEnsure("General", "EnableConsole", false);
+    Config::enableTextLogging = ReadBoolEnsure("General", "EnableTextLogging", false);
+    Config::enableEditingTools = ReadBoolEnsure("General", "EnableEditingTools", false);
+    ReadStringEnsure("General", "LogFile", ".\\tl\\hook.log", Config::logFile, sizeof(Config::logFile));
+    Config::dumpUntranslated = ReadBoolEnsure("General", "DumpUntranslated", false);
+    Config::enableDiscordPresence = ReadBoolEnsure("General", "EnableDiscordPresence", true);
 
     // Text
     {
         char mode[16];
-        ReadString("Text", "WrapMode", "pixel", mode, sizeof(mode));
+        ReadStringEnsure("Text", "WrapMode", "pixel", mode, sizeof(mode));
         if (_stricmp(mode, "off") == 0)        Config::wrapMode = Config::WrapMode::Off;
         else if (_stricmp(mode, "chars") == 0) Config::wrapMode = Config::WrapMode::Chars;
         else                                   Config::wrapMode = Config::WrapMode::Pixel;
     }
-    Config::wrapSafetyPx = ReadInt("Text", "WrapSafetyPx", 12);
-    Config::wordWrapWidth = ReadInt("Text", "WordWrapWidth", 70);
-    Config::warnOnOverflow = ReadBool("Text", "WarnOnOverflow", true);
+    Config::wrapSafetyPx = ReadIntEnsure("Text", "WrapSafetyPx", 12);
+    Config::wordWrapWidth = ReadIntEnsure("Text", "WordWrapWidth", 70);
+    Config::warnOnOverflow = ReadBoolEnsure("Text", "WarnOnOverflow", true);
 
     // Hotkeys
-    Config::reloadHotkey = ReadInt("Hotkeys", "ReloadKey", VK_F5);
-    Config::statsHotkey = ReadInt("Hotkeys", "StatsKey", VK_F6);
-    Config::logToggleHotkey = ReadInt("Hotkeys", "LogToggleKey", VK_F7);
+    Config::reloadHotkey = ReadIntEnsure("Hotkeys", "ReloadKey", VK_F5);
+    Config::statsHotkey = ReadIntEnsure("Hotkeys", "StatsKey", VK_F6);
+    Config::logToggleHotkey = ReadIntEnsure("Hotkeys", "LogToggleKey", VK_F7);
 
     // Font
-    ReadString("Font", "Name", "", Config::fontName, sizeof(Config::fontName));
-    ReadString("Font", "NameProportional", "", Config::fontNameProportional, sizeof(Config::fontNameProportional));
-    ReadString("Font", "FallbackJapanese", "", Config::fontFallbackJp, sizeof(Config::fontFallbackJp));
+    ReadStringEnsure("Font", "Name", "", Config::fontName, sizeof(Config::fontName));
+    ReadStringEnsure("Font", "NameProportional", "", Config::fontNameProportional, sizeof(Config::fontNameProportional));
+    ReadStringEnsure("Font", "FallbackJapanese", "", Config::fontFallbackJp, sizeof(Config::fontFallbackJp));
 
     // Files
-    ReadString("Files", "TranslationFile", Config::kDefaultTranslationFile, Config::translationFile, sizeof(Config::translationFile));
-    ReadString("Files", "ScriptsDir", Config::kDefaultScriptsDir, Config::scriptsDir, sizeof(Config::scriptsDir));
-    ReadString("Files", "NamesFile", Config::kDefaultNamesFile, Config::namesFile, sizeof(Config::namesFile));
-    ReadString("Files", "UiFile", Config::kDefaultUiFile, Config::uiFile, sizeof(Config::uiFile));
-    ReadString("Files", "CharIdFile", Config::kDefaultCharIdFile, Config::charIdFile, sizeof(Config::charIdFile));
+    ReadStringEnsure("Files", "TranslationFile", Config::kDefaultTranslationFile, Config::translationFile, sizeof(Config::translationFile));
+    ReadStringEnsure("Files", "ScriptsDir", Config::kDefaultScriptsDir, Config::scriptsDir, sizeof(Config::scriptsDir));
+    ReadStringEnsure("Files", "NamesFile", Config::kDefaultNamesFile, Config::namesFile, sizeof(Config::namesFile));
+    ReadStringEnsure("Files", "UiFile", Config::kDefaultUiFile, Config::uiFile, sizeof(Config::uiFile));
+    ReadStringEnsure("Files", "CharIdFile", Config::kDefaultCharIdFile, Config::charIdFile, sizeof(Config::charIdFile));
+    ReadStringEnsure("Files", "UntranslatedLog", Config::kDefaultUntranslatedLog, Config::untranslatedLog, sizeof(Config::untranslatedLog));
 
     // Asset Redirection
-    Config::enableAssetRedirect = ReadBool("Assets", "EnableRedirect", true);
-    Config::logAssetRedirects = ReadBool("Assets", "LogRedirects", false);
-    ReadString("Assets", "Path", Config::kDefaultTlAssetsPath, Config::tlAssetsPath, sizeof(Config::tlAssetsPath));
+    Config::enableAssetRedirect = ReadBoolEnsure("Assets", "EnableRedirect", true);
+    Config::logAssetRedirects = ReadBoolEnsure("Assets", "LogRedirects", false);
+    ReadStringEnsure("Assets", "Path", Config::kDefaultTlAssetsPath, Config::tlAssetsPath, sizeof(Config::tlAssetsPath));
 
     // Debug
-    Config::enableDebugMode = ReadBool("Debug", "EnableDebugMode", false);
-    Config::enableGameDebugOutput = ReadBool("Debug", "EnableGameDebugOutput", false);
+    Config::enableDebugMode = ReadBoolEnsure("Debug", "EnableDebugMode", false);
+    Config::enableGameDebugOutput = ReadBoolEnsure("Debug", "EnableGameDebugOutput", false);
 
     // Initialize debug state from config
     DebugJump::g_debugModeActive = Config::enableGameDebugOutput;
@@ -364,6 +417,12 @@ static void LoadConfig() {
 
     // Log
     Log("[CONFIG] Loaded from %s\n", Config::configFile);
+    for (const std::string& added : g_iniKeysAdded) {
+        Log("[CONFIG] Added missing key: %s\n", added.c_str());
+    }
+    for (const std::string& failed : g_iniKeysFailed) {
+        Log("[CONFIG] Could not write missing key: %s\n", failed.c_str());
+    }
     if (Config::fontName[0] != '\0') {
         Log("[CONFIG] Font: %s\n", Config::fontName);
     }
@@ -440,6 +499,14 @@ static void InitDiscordRPC() {
     g_discordRunning = true;
 
     g_discordThread = CreateThread(nullptr, 0, DiscordUpdateThreadProc, nullptr, 0, nullptr);
+    if (!g_discordThread) {
+        // Nothing would call Discord_RunCallbacks, so the connection never
+        // completes and every later update queues into a dead pipe.
+        Log("[Discord] CreateThread failed (error %lu) - presence disabled\n", GetLastError());
+        g_discordRunning = false;
+        Discord_Shutdown();
+        return;
+    }
 
     {
         std::lock_guard<std::mutex> lock(g_discordMutex);
@@ -809,7 +876,7 @@ namespace {
     // Command index of the MESSAGE currently being dispatched.
     // Captured by CmdMessage_Hook, consumed by AdvCharSay_Hook to key the lookup on
     // (file, index) instead of on the message text.
-    //-1 when say() is reached from any path other than cmdMessage.
+    // -1 when say() is reached from any path other than cmdMessage.
     thread_local int t_cmdIndex = -1;
 
     // Set while the backlog is being redrawn. drawHistory() runs from hitwait(),
@@ -826,7 +893,12 @@ namespace {
 
 class TranslationDB {
 public:
-    bool Load(const char* tsvPath, const char* namesPath) {
+    struct LoadSummary {
+        bool sourceFound = false;
+        bool dialogueFound = false;
+    };
+
+    LoadSummary Load(const char* tsvPath, const char* namesPath) {
         std::lock_guard<std::mutex> lock(m_dataMutex);
 
         m_names.clear();
@@ -886,13 +958,14 @@ public:
                          std::to_string(splitFiles) + " files)";
         } else {
             std::string utf8;
-            if (!ReadFileUtf8(tsvPath, utf8, encoding)) {
+            if (ReadFileUtf8(tsvPath, utf8, encoding)) {
+                ParseTsvContent(utf8, std::string(), namesByIndex, textsByIndex,
+                                textCount, choiceCount, labelCount);
+                sourceDesc = tsvPath;
+            } else {
                 Log("[TL] Cannot open: %s\n", tsvPath);
-                return globalCount > 0;  // Still OK if we loaded names
+                sourceDesc = "(no script source)";
             }
-            ParseTsvContent(utf8, std::string(), namesByIndex, textsByIndex,
-                            textCount, choiceCount, labelCount);
-            sourceDesc = tsvPath;
         }
 
         // load ui strings
@@ -933,12 +1006,25 @@ public:
         Log("[TL]   %d labels\n", labelCount);
         Log("[TL]   %d UI strings (from %s)\n", uiCount, Config::uiFile);
 
-        return true;
+        LoadSummary summary;
+        // Files that exist, not files that parsed - unreadable scripts leave
+        // splitFiles at 0.
+        summary.sourceFound = !scriptFiles.empty() ||
+                              (tsvPath && FileExists(tsvPath)) ||
+                              (namesPath && FileExists(namesPath)) ||
+                              FileExists(Config::uiFile);
+        // Not m_messages: CHOICE_ rows land there too, and would pass as dialogue.
+        summary.dialogueFound = textCount > 0;
+        return summary;
     }
 
     void Reload() {
         Log("[TL] Reloading...\n");
+        auto started = std::chrono::steady_clock::now();
         Load(Config::translationFile, Config::namesFile);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        Log("[TL] Reload finished in %lld ms\n", (long long)ms);
     }
 
         void FindInDB(const std::string& searchText) {
@@ -1274,11 +1360,15 @@ private:
             return 0;
         }
 
-        size_t fileSize = (size_t)file.tellg();
+        std::streamoff fileSize = file.tellg();
+        if (fileSize < 0) {
+            Log("[TL] Cannot size: %s\n", namesPath);
+            return 0;
+        }
         file.seekg(0);
 
-        std::string content(fileSize, 0);
-        file.read(&content[0], fileSize);
+        std::string content((size_t)fileSize, 0);
+        if (fileSize > 0) file.read(&content[0], fileSize);
 
         Encoding::Type encoding = Encoding::Detect(content.c_str(), content.size());
         std::string utf8Content = Encoding::ToUtf8(content, encoding);
@@ -1343,6 +1433,9 @@ private:
     }
 
     // List *.tsv in a directory, sorted. Empty vector if the folder is absent.
+    // ScriptsDir is assumed dedicated: pointing it at .\tl also feeds
+    // unique_names/ui/translation through here, and they are rejected only by
+    // column-shape accident.
     static std::vector<std::string> ListTsvFiles(const char* dir) {
         std::vector<std::string> out;
         if (!dir || !*dir) return out;
@@ -1621,7 +1714,7 @@ static thread_local bool g_measuringGlyph = false;
 namespace CharRestore {
     typedef std::unordered_map<size_t, wchar_t> Map;
 
-    static std::mutex                        g_mutex;
+    static std::mutex                           g_mutex;
     static std::unordered_map<std::string, Map> g_registry;
 
     // Wrap overwrites a space with '\n'; folding it back makes the drawn and
@@ -2178,17 +2271,18 @@ namespace WordWrap {
     static std::mutex g_overflowMutex;
     static std::unordered_set<std::string> g_overflowLogged;
 
+    static bool ClaimOverflowReport(const std::string& key) {
+        std::lock_guard<std::mutex> lock(g_overflowMutex);
+        return g_overflowLogged.insert(key).second;
+    }
+
     static void ReportOverflow(const std::string& file, int index,
                                int needLines, int maxLines, int boxPx,
                                const std::string& sjis) {
         if (!Config::warnOnOverflow) return;
 
         std::string key = file + ":" + std::to_string(index);
-        {
-            std::lock_guard<std::mutex> lock(g_overflowMutex);
-            if (g_overflowLogged.count(key)) return;
-            g_overflowLogged.insert(key);
-        }
+        if (!ClaimOverflowReport(key)) return;
 
         std::string utf8 = Encoding::SjisToUtf8(sjis.c_str());
         // Collapse the newlines we just inserted so the log stays one line
@@ -2256,28 +2350,62 @@ namespace WordWrap {
 //=============================================================================
 static std::atomic<bool> g_running{true};
 static HANDLE g_hotkeyThread = nullptr;
+static std::atomic<bool> g_modulePinFailed{false};
+
+// GetAsyncKeyState is global: F5 in an editor would reload in-game.
+// Keep both tests. The console reports the GAME's pid (measured) and opens in
+// front of it, so pid alone lets it through; a terminal host that owns its own
+// window is caught only by pid.
+static bool GameHasFocus() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    if (pid != GetCurrentProcessId()) return false;
+
+    if (HWND console = GetConsoleWindow()) {
+        if (fg == console || GetAncestor(fg, GA_ROOT) == console) return false;
+    }
+    return true;
+}
+
+static bool WaitForKeyRelease(int vk) {
+    while (g_running && (GetAsyncKeyState(vk) & 0x8000)) Sleep(10);
+    return g_running;
+}
 
 static DWORD WINAPI HotkeyThreadProc(LPVOID) {
     while (g_running) {
+        if (!GameHasFocus()) {
+            Sleep(Constants::kHotkeyPollIntervalMs);
+            continue;
+        }
+
+        // Rechecked after release: the key can be held through an alt-tab.
         // Reload translations
         if (GetAsyncKeyState(Config::reloadHotkey) & 0x8000) {
-            while (GetAsyncKeyState(Config::reloadHotkey) & 0x8000) Sleep(10);
+            if (!WaitForKeyRelease(Config::reloadHotkey)) break;
+            if (!GameHasFocus()) continue;
             g_translationDB.Reload();
             MessageBeep(MB_OK);
         }
 
         // Print stats
         if (GetAsyncKeyState(Config::statsHotkey) & 0x8000) {
-            while (GetAsyncKeyState(Config::statsHotkey) & 0x8000) Sleep(10);
+            if (!WaitForKeyRelease(Config::statsHotkey)) break;
+            if (!GameHasFocus()) continue;
             g_translationDB.PrintStats();
             MessageBeep(MB_OK);
         }
 
         // Toggle logging
         if (GetAsyncKeyState(Config::logToggleHotkey) & 0x8000) {
-            while (GetAsyncKeyState(Config::logToggleHotkey) & 0x8000) Sleep(10);
-            Config::enableTextLogging = !Config::enableTextLogging;
-            Log("[*] Text logging: %s\n", Config::enableTextLogging ? "ON" : "OFF");
+            if (!WaitForKeyRelease(Config::logToggleHotkey)) break;
+            if (!GameHasFocus()) continue;
+            bool on = !Config::enableTextLogging.load();
+            Config::enableTextLogging.store(on);
+            Log("[*] Text logging: %s\n", on ? "ON" : "OFF");
             MessageBeep(MB_OK);
         }
 
@@ -2298,12 +2426,16 @@ static void LoadCharIdTable(const char* path) {
         return;
     }
 
-    size_t size = (size_t)file.tellg();
+    std::streamoff size = file.tellg();
+    if (size < 0) {
+        Log("[TL] Cannot size: %s\n", path);
+        return;
+    }
     file.seekg(0);
-    std::string content(size, 0);
-    file.read(&content[0], size);
+    std::string content((size_t)size, 0);
+    if (size > 0) file.read(&content[0], size);
 
-    Encoding::Type enc = Encoding::Detect(content.c_str(), size);
+    Encoding::Type enc = Encoding::Detect(content.c_str(), (size_t)size);
     std::string utf8 = Encoding::ToUtf8(content, enc);
 
     std::istringstream iss(utf8);
@@ -2606,12 +2738,13 @@ static int __fastcall SaveDataTitle_Hook(
     void* pThis, void* edx,
     void* fcString, int slotType, int slotIndex, bool useTemplate, unsigned int* outTime)
 {
-    // Debug
-    Log("[SAVE] title() called: type=%d index=%d\n", slotType, slotIndex);
+    const bool trace = Config::enableTextLogging;
+
+    if (trace) Log("[SAVE] title() called: type=%d index=%d\n", slotType, slotIndex);
 
     // Check valid
     if (!g_SaveDataIsValid(pThis, slotType, slotIndex)) {
-        Log("[SAVE] Invalid slot\n");
+        if (trace) Log("[SAVE] Invalid slot\n");
         return g_origSaveDataTitle(pThis, fcString, slotType, slotIndex, useTemplate, outTime);
     }
 
@@ -2619,14 +2752,17 @@ static int __fastcall SaveDataTitle_Hook(
 
     // Empty slot - call original
     if (item[0] == 0) {
-        Log("[SAVE] Empty slot\n");
+        if (trace) Log("[SAVE] Empty slot\n");
         return g_origSaveDataTitle(pThis, fcString, slotType, slotIndex, useTemplate, outTime);
     }
 
     // Get label
     DWORD labelFCString = item[2];
     const char* labelSjis = *(const char**)(labelFCString + 0x14);
-    Log("[SAVE] Label raw: %p -> \"%s\"\n", labelSjis, labelSjis ? Encoding::SjisToUtf8(labelSjis).c_str() : "(null)");
+    if (trace) {
+        Log("[SAVE] Label raw: %p -> \"%s\"\n", labelSjis,
+            labelSjis ? Encoding::SjisToUtf8(labelSjis).c_str() : "(null)");
+    }
 
     // Try translate
     const char* finalLabel = labelSjis;
@@ -2646,8 +2782,8 @@ static int __fastcall SaveDataTitle_Hook(
             translatedSjis = Encoding::Utf8ToSjisTracked(translated.c_str(), lost);
             CharRestore::Register(translatedSjis, std::move(lost));
             finalLabel = translatedSjis.c_str();
-            Log("[SAVE] Found translation: \"%s\"\n", translated.c_str());
-        } else {
+            if (trace) Log("[SAVE] Found translation: \"%s\"\n", translated.c_str());
+        } else if (trace) {
             Log("[SAVE] No translation found!\n");
         }
     }
@@ -2759,31 +2895,31 @@ static char __fastcall LiteLoad_Hook(void* pThis, void* edx, const char* path, u
             filename = filename.substr(0, lastDot);
         }
 
+        // Map filename to friendly name for Discord RPC
+        std::string display;
+        if (filename == "title") {
+            display = "Main Menu";
+        }
+        else if (filename == "CgMode") {
+            display = "CG Gallery";
+        }
+        else if (filename == "Replay") {
+            display = "Scene Replay";
+        }
+        else if (filename == "MusicMode") {
+            display = "Music Room";
+        }
+        else if (filename == "ExtraMode") {
+            display = "Extras Menu";
+        }
+
         {
             std::lock_guard<std::mutex> lock(g_sceneMutex);
             g_currentFile = filename;
             g_currentLabel.clear();
-
-            // Map filename to friendly name for Discord RPC
-            std::string display;
-            if (filename == "title") {
-                display = "Main Menu";
-            }
-            else if (filename == "CgMode") {
-                display = "CG Gallery";
-            }
-            else if (filename == "Replay") {
-                display = "Scene Replay";
-            }
-            else if (filename == "MusicMode") {
-                display = "Music Room";
-            }
-            else if (filename == "ExtraMode") {
-                display = "Extras Menu";
-            }
-
-            UpdateChapterPresence(display);
         }
+
+        UpdateChapterPresence(display);
 
         Log("[LOAD] %s\n", filename.c_str());
     }
@@ -2806,13 +2942,18 @@ static void WINAPI OutputDebugStringA_Hook(LPCSTR lpOutputString) {
 
         if (isOverflowWarning && Config::warnOnOverflow && !DebugJump::g_debugModeActive) {
             std::string scene = CurrentSceneFile();
-            // The engine emits SJIS; the log is UTF-8.
-            std::string text = Encoding::SjisToUtf8(lpOutputString);
-            while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
-                text.pop_back();
+            if (scene.empty()) scene = "?";
+            // The engine re-emits this per repaint; Log() flushes every call.
+            if (WordWrap::ClaimOverflowReport("engine:" + scene + ":" +
+                                              std::to_string(t_cmdIndex))) {
+                // The engine emits SJIS; the log is UTF-8.
+                std::string text = Encoding::SjisToUtf8(lpOutputString);
+                while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
+                    text.pop_back();
+                }
+                Log("[WRAP] ENGINE OVERFLOW %s:%d  %s\n",
+                    scene.c_str(), t_cmdIndex, text.c_str());
             }
-            Log("[WRAP] ENGINE OVERFLOW %s:%d  %s\n",
-                scene.empty() ? "?" : scene.c_str(), t_cmdIndex, text.c_str());
         }
 
         if (DebugJump::g_debugModeActive) {
@@ -3053,15 +3194,17 @@ static DWORD WINAPI GetGlyphOutlineA_Hook(
 static HFONT WINAPI CreateFontIndirectA_Hook(const LOGFONTA* lf) {
     if (lf) {
         LOGFONTA modified = *lf;
-        std::string origName = Encoding::SjisToUtf8(lf->lfFaceName);
 
         // Same substitution the word wrapper measures with -- see
         // ApplyFontSubstitution's note on why it must be shared.
         ApplyFontSubstitution(modified);
 
-        Log("[FONT] %s (h=%d, cs=%d) -> %s (cs=%d)\n",
-            origName.c_str(), lf->lfHeight, lf->lfCharSet,
-            modified.lfFaceName, modified.lfCharSet);
+        if (Config::enableTextLogging) {
+            Log("[FONT] %s (h=%d, cs=%d) -> %s (cs=%d)\n",
+                Encoding::SjisToUtf8(lf->lfFaceName).c_str(),
+                lf->lfHeight, lf->lfCharSet,
+                modified.lfFaceName, modified.lfCharSet);
+        }
 
         HFONT created = g_origCreateFontIndirectA(&modified);
 
@@ -3117,27 +3260,50 @@ static HANDLE WINAPI CreateFileA_Hook(
 //=============================================================================
 class FileWatcher {
 public:
-    void Start(const char* directory, const std::vector<std::string>& watchFiles, std::function<void()> onChange) {
-        m_watchFiles = watchFiles;
+    struct Spec {
+        std::string directory;
+        bool anyTsv = false;
+        std::vector<std::string> exactNames;
+        std::vector<std::string> ignoreNames;
+    };
+
+    bool Start(const Spec& spec, std::function<void()> onChange) {
+        m_spec = spec;
         m_onChange = onChange;
         m_running = true;
 
-        // Get full directory path
-        char fullPath[MAX_PATH];
-        GetFullPathNameA(directory, MAX_PATH, fullPath, nullptr);
-        m_directory = fullPath;
+        // Not on the thread: Stop() can win that race and leave the watch in an
+        // INFINITE wait with nothing to signal it.
+        m_stopEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+        if (!m_stopEvent) {
+            Log("[FileWatcher] CreateEvent failed for %s (error %lu)\n",
+                m_spec.directory.c_str(), GetLastError());
+            m_running = false;
+            return false;
+        }
 
-        m_lastWriteTime = GetLatestModTime();
         m_thread = CreateThread(nullptr, 0, WatchThreadProc, this, 0, nullptr);
+        if (!m_thread) {
+            Log("[FileWatcher] CreateThread failed for %s (error %lu)\n",
+                m_spec.directory.c_str(), GetLastError());
+            CloseHandle(m_stopEvent);
+            m_stopEvent = nullptr;
+            m_running = false;
+            return false;
+        }
+        return true;
     }
 
-    void Stop() {
+    // False means the thread outlived the wait and may still be inside a
+    // reload, using m_spec/m_onChange - the caller must leak, not destroy.
+    bool Stop() {
         m_running = false;
-        if (m_stopEvent) {
-            SetEvent(m_stopEvent);
-        }
+        if (m_stopEvent) SetEvent(m_stopEvent);
+
         if (m_thread) {
-            WaitForSingleObject(m_thread, 2000);
+            if (WaitForSingleObject(m_thread, Constants::kWatcherStopTimeoutMs) != WAIT_OBJECT_0) {
+                return false;
+            }
             CloseHandle(m_thread);
             m_thread = nullptr;
         }
@@ -3145,6 +3311,7 @@ public:
             CloseHandle(m_stopEvent);
             m_stopEvent = nullptr;
         }
+        return true;
     }
 
 private:
@@ -3152,10 +3319,95 @@ private:
         return ((FileWatcher*)param)->WatchThread();
     }
 
+public:
+    static bool HasTsvExtension(const char* path) {
+        size_t n = strlen(path);
+        return n >= 4 && _stricmp(path + n - 4, ".tsv") == 0;
+    }
+
+private:
+
+    static const char* BaseName(const char* path) {
+        const char* slash = strrchr(path, '\\');
+        return slash ? slash + 1 : path;
+    }
+
+    struct Fingerprint {
+        unsigned long long count = 0;
+        unsigned long long hash = 1469598103934665603ULL;
+
+        bool operator!=(const Fingerprint& o) const {
+            return count != o.count || hash != o.hash;
+        }
+    };
+
+    static void Fold(Fingerprint& fp, const char* name,
+                     const FILETIME& ft, DWORD sizeHigh, DWORD sizeLow) {
+        ULARGE_INTEGER t;
+        t.LowPart = ft.dwLowDateTime;
+        t.HighPart = ft.dwHighDateTime;
+
+        unsigned long long entry = t.QuadPart ^
+                                   (((unsigned long long)sizeHigh << 32) | sizeLow);
+        // Not tolower(): UB on an SJIS lead byte, and locale-dependent.
+        for (const char* p = name; *p; ++p) {
+            unsigned char c = (unsigned char)*p;
+            if (c >= 'A' && c <= 'Z') c = (unsigned char)(c - 'A' + 'a');
+            entry = (entry ^ c) * 1099511628211ULL;
+        }
+        fp.hash += entry;   // order-independent, so directory order cannot matter
+        fp.count++;
+    }
+
+    Fingerprint Snapshot() const {
+        Fingerprint fp;
+
+        if (m_spec.anyTsv) {
+            WIN32_FIND_DATAA fd;
+            std::string pattern = m_spec.directory + "\\*.tsv";
+            HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                do {
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                    if (Ignored(fd.cFileName)) continue;
+                    Fold(fp, fd.cFileName, fd.ftLastWriteTime,
+                         fd.nFileSizeHigh, fd.nFileSizeLow);
+                } while (FindNextFileA(h, &fd));
+                FindClose(h);
+            }
+        }
+
+        for (const std::string& name : m_spec.exactNames) {
+            if (Ignored(name.c_str())) continue;
+            WIN32_FILE_ATTRIBUTE_DATA data;
+            std::string full = m_spec.directory + "\\" + name;
+            if (GetFileAttributesExA(full.c_str(), GetFileExInfoStandard, &data)) {
+                Fold(fp, name.c_str(), data.ftLastWriteTime,
+                     data.nFileSizeHigh, data.nFileSizeLow);
+            }
+        }
+        return fp;
+    }
+
+    bool Ignored(const char* name) const {
+        for (const std::string& ig : m_spec.ignoreNames) {
+            if (_stricmp(name, ig.c_str()) == 0) return true;
+        }
+        return false;
+    }
+
+    bool Matches(const char* relPath) const {
+        if (Ignored(BaseName(relPath))) return false;
+        if (m_spec.anyTsv && HasTsvExtension(relPath)) return true;
+        for (const std::string& name : m_spec.exactNames) {
+            if (_stricmp(relPath, name.c_str()) == 0) return true;
+        }
+        return false;
+    }
+
     DWORD WatchThread() {
-        m_stopEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
         HANDLE hDir = CreateFileA(
-            m_directory.c_str(),
+            m_spec.directory.c_str(),
             FILE_LIST_DIRECTORY,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             nullptr,
@@ -3165,71 +3417,172 @@ private:
         );
 
         if (hDir == INVALID_HANDLE_VALUE) {
-            Log("[FileWatcher] Failed to open directory: %s\n", m_directory.c_str());
+            Log("[FileWatcher] Failed to open directory: %s\n", m_spec.directory.c_str());
             return 1;
         }
 
-        Log("[FileWatcher] Watching directory: %s\n", m_directory.c_str());
-        for (auto& f : m_watchFiles) {
+        Log("[FileWatcher] Watching %s\n", m_spec.directory.c_str());
+        if (m_spec.anyTsv) Log("[FileWatcher]   - *.tsv\n");
+        for (const std::string& f : m_spec.exactNames) {
             Log("[FileWatcher]   - %s\n", f.c_str());
         }
 
-        char buffer[4096];
+        alignas(DWORD) BYTE buffer[16384];
         OVERLAPPED overlapped = {};
         overlapped.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+        if (!overlapped.hEvent) {
+            Log("[FileWatcher] CreateEvent failed for %s (error %lu)"
+                " - no longer watching\n", m_spec.directory.c_str(), GetLastError());
+            CloseHandle(hDir);
+            return 1;
+        }
 
         HANDLE waitHandles[2] = { overlapped.hEvent, m_stopEvent };
 
+        const DWORD kFilter = FILE_NOTIFY_CHANGE_LAST_WRITE |
+                              FILE_NOTIFY_CHANGE_SIZE |
+                              FILE_NOTIFY_CHANGE_FILE_NAME;
+
+        bool armed = false;
+        bool pending = false;
+        ULONGLONG deadline = 0;
+        int namesLogged = 0;
+        constexpr int kMaxNamesPerWindow = 5;
+
+        // Only a matching change may move the deadline; rescheduling on every
+        // completion lets unrelated churn postpone a real reload indefinitely.
+        auto schedule = [&]() {
+            pending = true;
+            deadline = GetTickCount64() + Constants::kFileWatcherDebounceMs;
+        };
+
+        Fingerprint seen = Snapshot();
+
+        bool saidSuppressed = false;
+
+        // hook.log sits in tl\ and is flushed per line, so an unconditional
+        // reload here would feed its own watcher.
+        auto scheduleIfChanged = [&]() {
+            Fingerprint now = Snapshot();
+            if (now != seen) {
+                seen = now;
+                Log("[FileWatcher] change buffer overflowed on %s"
+                    " - watched files differ, reloading\n", m_spec.directory.c_str());
+                schedule();
+            } else if (!saidSuppressed) {
+                saidSuppressed = true;
+                Log("[FileWatcher] change buffer overflowed on %s from unrelated"
+                    " activity - no watched file changed (further ones silent)\n",
+                    m_spec.directory.c_str());
+            }
+        };
+
         while (m_running) {
-            DWORD bytesReturned = 0;
-            ResetEvent(overlapped.hEvent);
-
-            BOOL result = ReadDirectoryChangesW(
-                hDir, buffer, sizeof(buffer), FALSE,
-                FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
-                &bytesReturned, &overlapped, nullptr
-            );
-
-            if (!result && GetLastError() != ERROR_IO_PENDING) break;
-
-            DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
-
-            if (waitResult == WAIT_OBJECT_0) {
-                if (GetOverlappedResult(hDir, &overlapped, &bytesReturned, FALSE)) {
-                    FILE_NOTIFY_INFORMATION* info = (FILE_NOTIFY_INFORMATION*)buffer;
-
-                    bool shouldReload = false;do {
-                        std::wstring changedFileW(info->FileName, info->FileNameLength / sizeof(WCHAR));
-                        char changedFile[MAX_PATH];
-                        WideCharToMultiByte(CP_ACP, 0, changedFileW.c_str(), -1, changedFile, MAX_PATH, nullptr, nullptr);
-
-                        // Check if it's one of our watched files
-                        for (auto& watchFile : m_watchFiles) {
-                            if (_stricmp(changedFile, watchFile.c_str()) == 0) {
-                                shouldReload = true;
-                                Log("[FileWatcher] %s changed\n", changedFile);
-                                break;
-                            }
-                        }
-
-                        if (info->NextEntryOffset == 0) break;
-                        info = (FILE_NOTIFY_INFORMATION*)((char*)info + info->NextEntryOffset);
-                    } while (true);
-
-                    if (shouldReload) {
-                        Sleep(Constants::kFileWatcherDebounceMs);  // Debounce
-                        FILETIME newTime = GetLatestModTime();
-                        if (CompareFileTime(&newTime, &m_lastWriteTime) != 0) {
-                            m_lastWriteTime = newTime;
-                            if (m_onChange) {
-                                m_onChange();
-                            }
-                        }
+            if (!armed) {
+                DWORD ignored = 0;
+                ResetEvent(overlapped.hEvent);
+                if (!ReadDirectoryChangesW(hDir, buffer, sizeof(buffer),
+                                           FALSE, kFilter,
+                                           &ignored, &overlapped, nullptr)) {
+                    DWORD err = GetLastError();
+                    if (err != ERROR_IO_PENDING) {
+                        Log("[FileWatcher] ReadDirectoryChangesW failed on %s (error %lu)"
+                            " - no longer watching\n", m_spec.directory.c_str(), err);
+                        break;
                     }
                 }
-            } else if (waitResult == WAIT_OBJECT_0 + 1) {
-                break;
+                armed = true;
             }
+
+            // Read once: two samples let the deadline pass between them, and
+            // deadline - now then wraps to ~49 days or exactly INFINITE.
+            ULONGLONG now = GetTickCount64();
+
+            // Reloads with the request still armed: edits during the reload land
+            // in the kernel's buffer instead of being missed.
+            if (pending && now >= deadline) {
+                pending = false;
+                namesLogged = 0;
+                if (!m_running) break;
+                seen = Snapshot();
+                if (m_onChange) m_onChange();
+                continue;
+            }
+
+            DWORD timeout = INFINITE;
+            if (pending) {
+                timeout = (DWORD)std::min<ULONGLONG>(deadline - now, MAXDWORD - 1);
+            }
+
+            DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, timeout);
+
+            if (waitResult == WAIT_OBJECT_0) {
+                armed = false;
+                DWORD bytesReturned = 0;
+
+                if (!GetOverlappedResult(hDir, &overlapped, &bytesReturned, FALSE)) {
+                    DWORD err = GetLastError();
+                    if (err == ERROR_OPERATION_ABORTED) break;
+                    if (err == ERROR_NOTIFY_ENUM_DIR) {
+                        scheduleIfChanged();
+                        continue;
+                    }
+                    Log("[FileWatcher] GetOverlappedResult failed on %s (error %lu)"
+                        " - no longer watching\n", m_spec.directory.c_str(), err);
+                    break;
+                }
+
+                if (bytesReturned == 0) {
+                    scheduleIfChanged();
+                    continue;
+                }
+
+                FILE_NOTIFY_INFORMATION* info = (FILE_NOTIFY_INFORMATION*)buffer;
+                bool matched = false;
+                std::string changed;
+                while (true) {
+                    std::wstring changedW(info->FileName, info->FileNameLength / sizeof(WCHAR));
+                    // Sized from the conversion, not MAX_PATH: a name whose
+                    // CP932 form is longer would otherwise be dropped silently.
+                    int need = WideCharToMultiByte(CP_ACP, 0, changedW.c_str(), -1,
+                                                   nullptr, 0, nullptr, nullptr);
+                    changed.assign(need > 0 ? (size_t)need : 0, '\0');
+                    bool converted = need > 0 &&
+                        WideCharToMultiByte(CP_ACP, 0, changedW.c_str(), -1,
+                                            &changed[0], need, nullptr, nullptr) > 0;
+                    // need counts the terminator; drop it so size() is the name.
+                    if (converted && !changed.empty() && changed.back() == '\0') {
+                        changed.pop_back();
+                    }
+                    if (converted && Matches(changed.c_str())) {
+                        if (namesLogged < kMaxNamesPerWindow) {
+                            Log("[FileWatcher] %s changed\n", changed.c_str());
+                            namesLogged++;
+                        }
+                        matched = true;
+                        schedule();
+                    }
+
+                    if (info->NextEntryOffset == 0) break;
+                    info = (FILE_NOTIFY_INFORMATION*)((char*)info + info->NextEntryOffset);
+                }
+
+                // Or an overflow before the deadline keeps seeing this same edit
+                // and pushing the reload out.
+                if (matched) seen = Snapshot();
+            } else if (waitResult == WAIT_FAILED) {
+                Log("[FileWatcher] WaitForMultipleObjects failed on %s (error %lu)"
+                    " - no longer watching\n", m_spec.directory.c_str(), GetLastError());
+                break;
+            } else if (waitResult != WAIT_TIMEOUT) {
+                break;   // stop event
+            }
+        }
+
+        if (armed) {
+            CancelIo(hDir);
+            DWORD discarded = 0;
+            GetOverlappedResult(hDir, &overlapped, &discarded, TRUE);
         }
 
         CloseHandle(overlapped.hEvent);
@@ -3237,30 +3590,122 @@ private:
         return 0;
     }
 
-    FILETIME GetLatestModTime() {
-        FILETIME latest = {};
-        for (auto& filename : m_watchFiles) {
-            std::string fullPath = m_directory + "\\" + filename;
-            WIN32_FILE_ATTRIBUTE_DATA data;
-            if (GetFileAttributesExA(fullPath.c_str(), GetFileExInfoStandard, &data)) {
-                if (CompareFileTime(&data.ftLastWriteTime, &latest) > 0) {
-                    latest = data.ftLastWriteTime;
-                }
-            }
-        }
-        return latest;
-    }
-
-    std::vector<std::string> m_watchFiles;
-    std::string m_directory;
+    Spec m_spec;
     std::function<void()> m_onChange;
     std::atomic<bool> m_running{false};
     HANDLE m_thread = nullptr;
     HANDLE m_stopEvent = nullptr;
-    FILETIME m_lastWriteTime = {};
 };
 
-static FileWatcher g_fileWatcher;
+// char_table.tsv is left out on purpose: g_charIdToName has no mutex and is read
+// from the render path, so reloading it would race.
+static std::vector<std::unique_ptr<FileWatcher>> g_fileWatchers;
+
+static std::string DirNameOf(const std::string& path) {
+    size_t slash = path.find_last_of("\\/");
+    if (slash == std::string::npos) return ".";
+    // "C:\file" -> "C:\", not "C:" -- those name different places to Win32.
+    if (slash == 2 && path.size() >= 3 && path[1] == ':') return path.substr(0, 3);
+    if (slash == 0) return path.substr(0, 1);
+    return path.substr(0, slash);
+}
+
+static std::string BaseNameOf(const std::string& path) {
+    size_t slash = path.find_last_of("\\/");
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+static std::string FullPathOf(const std::string& path) {
+    char buf[MAX_PATH];
+    DWORD n = GetFullPathNameA(path.c_str(), MAX_PATH, buf, nullptr);
+    std::string out = (n > 0 && n < MAX_PATH) ? std::string(buf) : path;
+
+    auto isRoot = [](const std::string& s) {
+        return s.size() <= 3 && s.size() >= 2 && s[1] == ':';
+    };
+    while (out.size() > 1 && !isRoot(out) &&
+           (out.back() == '\\' || out.back() == '/')) {
+        out.pop_back();
+    }
+    return out;
+}
+
+static size_t StartTranslationWatchers(std::function<void()> onChange) {
+    std::vector<FileWatcher::Spec> specs;
+
+    // Per directory, not by basename: a same-named file under another root must
+    // stay watched. char_table.tsv is here for ScriptsDir=.\tl, where anyTsv
+    // would otherwise match it.
+    struct Exclusion { std::string dir, base; };
+    Exclusion exclusions[2];
+    {
+        std::string a = FullPathOf(Config::untranslatedLog);
+        exclusions[0] = { DirNameOf(a), BaseNameOf(a) };
+        std::string b = FullPathOf(Config::charIdFile);
+        exclusions[1] = { DirNameOf(b), BaseNameOf(b) };
+    }
+
+    auto findSpec = [&specs](const std::string& dir) -> FileWatcher::Spec* {
+        for (FileWatcher::Spec& s : specs) {
+            if (_stricmp(s.directory.c_str(), dir.c_str()) == 0) return &s;
+        }
+        return nullptr;
+    };
+
+    auto addSpec = [&](FileWatcher::Spec s) {
+        for (const Exclusion& ex : exclusions) {
+            if (_stricmp(s.directory.c_str(), ex.dir.c_str()) == 0) {
+                s.ignoreNames.push_back(ex.base);
+            }
+        }
+        specs.push_back(std::move(s));
+    };
+
+    // Never a subtree watch: TranslationDB::ListTsvFiles globs one level, so a
+    // nested TSV would trigger a reload that cannot read it.
+    if (Config::scriptsDir[0]) {
+        FileWatcher::Spec s;
+        s.directory = FullPathOf(Config::scriptsDir);
+        s.anyTsv = true;
+        addSpec(std::move(s));
+    }
+
+    for (const char* file : { Config::translationFile, Config::namesFile, Config::uiFile }) {
+        if (!file[0]) continue;
+        std::string full = FullPathOf(file);
+        std::string dir = DirNameOf(full);
+        std::string base = BaseNameOf(full);
+
+        if (FileWatcher::Spec* existing = findSpec(dir)) {
+            if (!(existing->anyTsv && FileWatcher::HasTsvExtension(base.c_str()))) {
+                existing->exactNames.push_back(base);
+            }
+            continue;
+        }
+        FileWatcher::Spec s;
+        s.directory = dir;
+        s.exactNames.push_back(base);
+        addSpec(std::move(s));
+    }
+
+    for (const FileWatcher::Spec& s : specs) {
+        auto watcher = std::make_unique<FileWatcher>();
+        if (watcher->Start(s, onChange)) {
+            g_fileWatchers.push_back(std::move(watcher));
+        }
+    }
+    return g_fileWatchers.size();
+}
+
+static void StopTranslationWatchers() {
+    for (auto& watcher : g_fileWatchers) {
+        if (!watcher->Stop()) {
+            Log("[FileWatcher] thread did not stop in time - leaking the watcher\n");
+            watcher.release();
+        }
+    }
+    g_fileWatchers.clear();
+}
 
 //=============================================================================
 // Locale Independence Hooks
@@ -3796,7 +4241,8 @@ static int WINAPI WideCharToMultiByte_Hook(UINT, DWORD, LPCWCH, int, LPSTR, int,
 static HWND WINAPI CreateWindowExA_Hook(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
 static BOOL WINAPI SetWindowTextA_Hook(HWND, LPCSTR);
 
-static HWND g_mainGameWindow = nullptr;
+// Title hooks only; GameHasFocus deliberately does not use it.
+static std::atomic<HWND> g_mainGameWindow{ nullptr };
 
 static BOOL CALLBACK FixEarlyWindowProc(HWND hwnd, LPARAM) {
     if (!Config::windowTitle[0]) return TRUE;
@@ -3827,6 +4273,30 @@ static bool HookLocaleApi(const char* name, void* detour, void** original) {
     return false;
 }
 
+// Unhooked converter on purpose: our own hook forces CP_ACP to 932, which would
+// mojibake a path written in the machine's real ANSI codepage.
+static std::wstring AnsiPathToWide(const char* s) {
+    std::wstring out;
+    if (!s || !*s) return out;
+
+    auto convert = [&](wchar_t* dst, int cap) {
+        return g_origMultiByteToWideChar
+            ? g_origMultiByteToWideChar(CP_ACP, 0, s, -1, dst, cap)
+            : MultiByteToWideChar(CP_ACP, 0, s, -1, dst, cap);
+    };
+
+    int len = convert(nullptr, 0);          // includes the terminator
+    if (len <= 1) return out;
+
+    out.resize((size_t)len);                // room for the terminator Win32 writes
+    if (convert(&out[0], len) <= 0) {
+        out.clear();
+        return out;
+    }
+    if (!out.empty() && out.back() == L'\0') out.pop_back();
+    return out;
+}
+
 //=============================================================================
 // Initialization
 //=============================================================================
@@ -3834,6 +4304,11 @@ static bool Initialize() {
     // Load config FIRST (before console init, so we know if console is enabled)
     LoadConfig();
     InitDiskLog();
+
+    if (g_modulePinFailed.load()) {
+        Log("[!] Module pin failed at load; unloading this DLL would be unsafe."
+            " Harmless for the normal statically-imported install.\n");
+    }
 
     // what are we on
     Log("[LOCALE] system ACP=%u\n", GetACP());
@@ -3923,6 +4398,10 @@ static bool Initialize() {
         }
     }
 
+    // Before any hook is enabled: g_charIdToName has no mutex, and
+    // AdvCharSay_Hook reads it from the render thread.
+    LoadCharIdTable(Config::charIdFile);
+
     HMODULE hResident = GetModuleHandleA("resident.dll");
     if (hResident) {
         InstallHooks(hResident);
@@ -3957,32 +4436,54 @@ static bool Initialize() {
     }
 
     // Load translations using config paths
-    g_translationDB.Load(Config::translationFile, Config::namesFile);
-    LoadCharIdTable(Config::charIdFile);
+    TranslationDB::LoadSummary tlSummary =
+        g_translationDB.Load(Config::translationFile, Config::namesFile);
 
-    std::string watchDir = ".\\tl";
-    std::string transFile = Config::translationFile;
-    size_t lastSlash = transFile.find_last_of("\\/");
-    if (lastSlash != std::string::npos) {
-        watchDir = transFile.substr(0, lastSlash);
+    if (Config::enableEditingTools) {
+        size_t watchers = StartTranslationWatchers([]() {
+            g_translationDB.Reload();
+            MessageBeep(MB_OK);
+        });
+        g_hotkeyThread = CreateThread(nullptr, 0, HotkeyThreadProc, nullptr, 0, nullptr);
+        if (!g_hotkeyThread) {
+            Log("[!] Hotkey thread failed to start (error %lu)\n", GetLastError());
+        }
+        Log("[*] Editing tools: reload hotkey %s, %zu file watcher(s)\n",
+            g_hotkeyThread ? "on" : "FAILED", watchers);
     }
-    g_fileWatcher.Start(watchDir.c_str(), {
-        AssetRedirect::GetFileName(Config::translationFile),
-        AssetRedirect::GetFileName(Config::namesFile),
-        AssetRedirect::GetFileName(Config::uiFile)
-    }, []() {
-        g_translationDB.Reload();
-        MessageBeep(MB_OK);
-    });
 
-    g_hotkeyThread = CreateThread(nullptr, 0, HotkeyThreadProc, nullptr, 0, nullptr);
+    if (tlSummary.sourceFound && !tlSummary.dialogueFound) {
+        Log("[!] Translation files present but no dialogue was loaded"
+            " (ScriptsDir=%s, TranslationFile=%s)\n",
+            Config::scriptsDir, Config::translationFile);
+
+        // A translator starts with empty TRANSLATION columns; don't box them.
+        if (!Config::enableEditingTools) {
+            std::wstring msg =
+                L"Translation files were found, but no dialogue translations "
+                L"were loaded.\n\n"
+                L"This usually means the patch is installed incompletely. Check "
+                L"the paths under [Files] in yotsuiro_tl.ini";
+            std::wstring wlog = AnsiPathToWide(Config::logFile);
+            if (!wlog.empty()) {
+                msg += L", and see " + wlog + L" for what was actually read";
+            }
+            msg += L".\n\nThe game will run with untranslated dialogue.";
+
+            MessageBoxW(nullptr, msg.c_str(), L"Yotsuiro Translation Hook",
+                        MB_ICONWARNING | MB_OK | MB_SETFOREGROUND);
+        }
+    }
 
     return true;
 }
 
+// Normally unreachable: pinned, statically imported, and process exit passes a
+// non-null lpReserved. Best-effort only - Stop() may time out and leave a
+// thread running, so dynamic unload is not supported.
 static void Shutdown() {
     g_running = false;
-    g_fileWatcher.Stop();
+    StopTranslationWatchers();
 
     if (Config::enableDiscordPresence) {
         ShutdownDiscordRPC();
@@ -3999,7 +4500,9 @@ static void Shutdown() {
     JpFallback::Release();
 
     if (g_logFile) {
+        std::lock_guard<std::mutex> lock(g_logMutex);
         fclose(g_logFile);
+        g_logFile = nullptr;   // threads that outlive Shutdown still call Log()
         FreeConsole();
     }
 
@@ -4147,6 +4650,19 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
     switch (reason) {
     case DLL_PROCESS_ATTACH: {
         DisableThreadLibraryCalls(hModule);
+        // Worker threads can't be joined under the loader lock. Never fail on
+        // this: returning FALSE would kill the game at process init.
+        {
+            HMODULE pin = nullptr;
+            if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN |
+                                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                                    (LPCWSTR)&DllMain, &pin)) {
+                // Only channel alive this early; repeated to hook.log later.
+                OutputDebugStringA("[YotsuiroHook] module pin failed; "
+                                   "unload would be unsafe\n");
+                g_modulePinFailed.store(true);
+            }
+        }
         wchar_t path[MAX_PATH];
         GetModuleFileNameW(hModule, path, MAX_PATH);
         const wchar_t* name = wcsrchr(path, L'\\');
