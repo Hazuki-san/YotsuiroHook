@@ -46,16 +46,23 @@ namespace Offsets {
 //
 //   ctx = *(void**)(*(void**)(printMgr + Target) + FCStringData)
 //
+// That chain lands on slot 0 of a context array (0x958-byte slots). The
+// table below describes slot 0, the message body.
+//
 // The engine lays out text using three values from this context:
 //
 //   newline position : x = RectLeft + Indent,  y = PenY + LineHeight
 //   usable width     : RectRight - (RectLeft + Indent)
 //   pen advance      : x += GLYPHMETRICS.gmCellIncX, per character
 //
+// Vertical writing (Flags bit 2) swaps the roles: x = PenX - LineHeight,
+// y = RectTop + Indent. WrapForPrint refuses vertical contexts.
+//
 // Note on pen advance: the engine does not use gmCellIncX directly. The glyph
 // rasterizer stores gmCellIncX + 4, and the pen-movement routine subtracts 4
 // when applying the stored value. The two adjustments cancel, so each
-// character advances the pen by exactly gmCellIncX.
+// character advances the pen by exactly gmCellIncX. The pen routine also
+// supports vertical and right-to-left directions; only LTR is modelled here.
 //
 // gmCellIncX comes from the installed font file, not from the engine. Two
 // machines with different builds of MS Gothic or MS PGothic produce different
@@ -784,6 +791,12 @@ namespace Encoding {
         return sjis;
     }
 
+    static bool AttachesToPrevious(wchar_t wc) {
+        WORD type = 0;
+        if (!GetStringTypeW(CT_CTYPE3, &wc, 1, &type)) return false;
+        return (type & C3_NONSPACING) != 0 || wc == 0x0E33;
+    }
+
     // Same as Utf8ToSjis, but also reports characters that CP932 cannot
     // represent (em dashes, accented Latin letters). WideCharToMultiByte
     // replaces those characters with a best-fit substitute and still returns
@@ -791,7 +804,7 @@ namespace Encoding {
     // On return, `lost` maps each byte offset in the output string to the
     // original character that was replaced at that offset.
     std::string Utf8ToSjisTracked(const char* utf8,
-                                  std::unordered_map<size_t, wchar_t>& lost) {
+                                  std::unordered_map<size_t, std::wstring>& lost) {
         lost.clear();
         if (!utf8 || !*utf8) return "";
 
@@ -806,23 +819,38 @@ namespace Encoding {
         sjis.reserve(wide.size() * 2);
 
         char buf[8];
-        for (size_t i = 0; i < wide.size(); i++) {
-            BOOL usedDefault = FALSE;
-            int n = WideCharToMultiByte(932, WC_NO_BEST_FIT_CHARS, &wide[i], 1,
-                                        buf, sizeof(buf), nullptr, &usedDefault);
-            if (n > 0 && !usedDefault) {
-                sjis.append(buf, n);        // The character converts cleanly; keep it.
-                continue;
+        for (size_t i = 0; i < wide.size(); ) {
+            size_t end = i + 1;
+            while (end < wide.size() && AttachesToPrevious(wide[end])) end++;
+
+            if (end - i == 1) {
+                BOOL usedDefault = FALSE;
+                int n = WideCharToMultiByte(932, WC_NO_BEST_FIT_CHARS, &wide[i], 1,
+                                            buf, sizeof(buf), nullptr, &usedDefault);
+                if (n > 0 && !usedDefault) {
+                    sjis.append(buf, n);    // The character converts cleanly; keep it.
+                    i = end;
+                    continue;
+                }
             }
             // This character has no CP932 encoding. Emit the best-fit substitute
             // (an unaccented letter, or '?') so the string remains valid Shift-JIS,
             // and record what was lost so the glyph hook can draw the original
             // character later. If that hook is missing or fails, the text still
             // renders with the substitute instead of garbage.
-            n = WideCharToMultiByte(932, 0, &wide[i], 1, buf, sizeof(buf), nullptr, nullptr);
+            int n = WideCharToMultiByte(932, 0, &wide[i], 1, buf, sizeof(buf), nullptr, nullptr);
             if (n <= 0) { buf[0] = '?'; n = 1; }
-            lost[sjis.size()] = wide[i];
+            // The renderer never rasterizes a space, only advances past it,
+            // so a space substitute would make the cluster undrawable.
+            if ((n == 1 && buf[0] == ' ') ||
+                (n == 2 && (unsigned char)buf[0] == 0x81 &&
+                 (unsigned char)buf[1] == 0x40)) {
+                buf[0] = '?';
+                n = 1;
+            }
+            lost[sjis.size()] = std::wstring(&wide[i], end - i);
             sjis.append(buf, n);
+            i = end;
         }
         return sjis;
     }
@@ -1836,7 +1864,7 @@ static thread_local bool g_measuringGlyph = false;
 // PrintSub_Hook selects the record for the string being printed; the glyph
 // hook consumes it.
 namespace CharRestore {
-    typedef std::unordered_map<size_t, wchar_t> Map;
+    typedef std::unordered_map<size_t, std::wstring> Map;
 
     static std::mutex                           g_mutex;
     static std::unordered_map<std::string, Map> g_registry;
@@ -1930,8 +1958,11 @@ namespace CharRestore {
     constexpr size_t kIterStart  = 24;
     constexpr size_t kIterCursor = 28;
 
-    // 0 when there is nothing to substitute at the current cursor.
-    static wchar_t CharAtCursor() {
+    // 0 when there is nothing to substitute at the current cursor. The
+    // cursor must hold the character GDI asked for - the engine rasterizes
+    // glyphs while the iterator is parked elsewhere, e.g. its kinsoku
+    // pull-in. Same check as CharAtTextOut.
+    static const std::wstring* CharAtCursor(UINT uChar) {
         if (!t_printData || t_map.empty() || g_measuringGlyph) return 0;
 
         const char* start  = *(const char* const*)((const char*)t_printData + kIterStart);
@@ -1940,7 +1971,24 @@ namespace CharRestore {
         if (start != t_str) return 0;   // not the string this record describes
 
         auto it = t_map.find((size_t)(cursor - start));
-        return it == t_map.end() ? 0 : it->second;
+        if (it == t_map.end()) return 0;
+
+        unsigned char a = (unsigned char)cursor[0];
+        UINT here = a;
+        if ((a >= 0x81 && a <= 0x9F) || (a >= 0xE0 && a <= 0xFC)) {
+            unsigned char b = (unsigned char)cursor[1];
+            if (b) here = ((UINT)a << 8) | b;
+        }
+        if (here != uChar) {
+            static bool s_said = false;
+            if (!s_said) {
+                s_said = true;
+                Log("[ACCENT] print cursor out of step (uChar=0x%04X here=0x%04X)"
+                    " - substitution skipped\n", uChar, here);
+            }
+            return 0;
+        }
+        return &it->second;
     }
 
     // The textOut renderers do not pass UxPrintData, so there is no cursor
@@ -2001,7 +2049,7 @@ namespace CharRestore {
     // asked for. If they differ, the CharNextA-tracking assumption does not
     // hold on this build; disable restoration for this path so the best-fit
     // substitute renders instead of a wrong glyph.
-    static wchar_t CharAtTextOut(UINT uChar) {
+    static const std::wstring* CharAtTextOut(UINT uChar) {
         if (!t_toBase || !t_toCur || t_toMap.empty() || g_measuringGlyph) return 0;
         if (t_toCur < t_toBase) return 0;
 
@@ -2023,7 +2071,265 @@ namespace CharRestore {
             }
             return 0;
         }
-        return it->second;
+        return &it->second;
+    }
+}
+
+namespace CharGlyph {
+    struct Entry {
+        GLYPHMETRICS      gm = {};
+        std::vector<BYTE> bits;
+        size_t            rowStride = 0;   // bytes per packed row in `bits`
+    };
+
+    static std::mutex g_mutex;
+    static std::unordered_map<uint64_t, std::unordered_map<std::wstring, Entry>> g_cache;
+
+    static HDC     g_dc      = nullptr;
+    static HBITMAP g_bitmap  = nullptr;
+    static HBITMAP g_prevBmp = nullptr;
+    static BYTE*   g_pixels  = nullptr;
+    static int     g_width   = 0;
+    static int     g_height  = 0;
+
+    static int GrayLevels(UINT fuFormat) {
+        switch (fuFormat) {
+        case GGO_GRAY2_BITMAP: return 4;
+        case GGO_GRAY4_BITMAP: return 16;
+        case GGO_GRAY8_BITMAP: return 64;
+        default:               return 0;
+        }
+    }
+
+    static bool EnsureDC() {
+        if (g_dc) return true;
+        g_dc = CreateCompatibleDC(nullptr);
+        if (!g_dc) return false;
+        SetBkColor(g_dc, RGB(0, 0, 0));
+        SetTextColor(g_dc, RGB(255, 255, 255));
+        SetBkMode(g_dc, OPAQUE);
+        SetTextAlign(g_dc, TA_LEFT | TA_TOP);
+        return true;
+    }
+
+    static bool EnsureBitmap(int width, int height) {
+        if (g_bitmap && width <= g_width && height <= g_height) return true;
+        if (width  < g_width)  width  = g_width;
+        if (height < g_height) height = g_height;
+
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth       = width;
+        bi.bmiHeader.biHeight      = -height;
+        bi.bmiHeader.biPlanes      = 1;
+        bi.bmiHeader.biBitCount    = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+
+        void* pixels = nullptr;
+        HBITMAP bitmap = CreateDIBSection(g_dc, &bi, DIB_RGB_COLORS, &pixels, nullptr, 0);
+        if (!bitmap) return false;
+
+        HGDIOBJ prev = SelectObject(g_dc, bitmap);
+        if (g_bitmap) DeleteObject(g_bitmap);
+        else          g_prevBmp = (HBITMAP)prev;
+
+        g_bitmap = bitmap;
+        g_pixels = (BYTE*)pixels;
+        g_width  = width;
+        g_height = height;
+        return true;
+    }
+
+    static bool Pack(const TEXTMETRICW& tm, int advance, int pad, int width, int height,
+                     UINT fuFormat, Entry& out) {
+        const size_t srcStride = (size_t)g_width * 4;
+
+        int inkLeft = width, inkTop = height, inkRight = -1, inkBottom = -1;
+        for (int y = 0; y < height; y++) {
+            const BYTE* row = g_pixels + (size_t)y * srcStride;
+            for (int x = 0; x < width; x++) {
+                const BYTE* px = row + (size_t)x * 4;
+                if (px[0] | px[1] | px[2]) {
+                    if (x < inkLeft)   inkLeft   = x;
+                    if (x > inkRight)  inkRight  = x;
+                    if (y < inkTop)    inkTop    = y;
+                    if (y > inkBottom) inkBottom = y;
+                }
+            }
+        }
+
+        out.gm.gmCellIncX = (short)advance;
+        if (inkRight < inkLeft || inkBottom < inkTop) return true;
+
+        int originX = inkLeft - pad;
+        int originY = (pad + tm.tmAscent) - inkTop;
+        int boxX    = inkRight - inkLeft + 1;
+        int boxY    = inkBottom - inkTop + 1;
+        int inc     = advance;
+
+        if (originX < 0) {
+            inc += -originX;
+            originX = 0;
+        }
+        if (originX + boxX > inc) inc = originX + boxX;
+        out.gm.gmCellIncX = (short)inc;
+
+        int top = tm.tmAscent - originY;
+        if (top < 0) {
+            inkTop += -top;
+            boxY   -= -top;
+            originY = tm.tmAscent;
+            top = 0;
+        }
+        if (top + boxY > tm.tmHeight) boxY = tm.tmHeight - top;
+        if (boxY <= 0) return true;
+
+        const int levels = GrayLevels(fuFormat);
+        if (levels == 0 && (boxX % 32) == 0) boxX++;
+
+        const int dstStride = (levels == 0) ? ((boxX + 31) / 32) * 4
+                                            : ((boxX + 3) & ~3);
+        out.rowStride = (size_t)dstStride;
+        out.bits.assign((size_t)dstStride * boxY, 0);
+
+        for (int y = 0; y < boxY; y++) {
+            const BYTE* row = g_pixels + (size_t)(inkTop + y) * srcStride;
+            BYTE*       dst = out.bits.data() + (size_t)y * dstStride;
+            for (int x = 0; x < boxX; x++) {
+                const int srcX = inkLeft + x;
+                if (srcX >= width) break;
+                const BYTE* px = row + (size_t)srcX * 4;
+                int cov = px[0];
+                if (px[1] > cov) cov = px[1];
+                if (px[2] > cov) cov = px[2];
+                if (levels == 0) {
+                    if (cov >= 128) dst[x >> 3] |= (BYTE)(0x80 >> (x & 7));
+                } else {
+                    int v = (cov * levels + 127) / 255;
+                    if (v > levels) v = levels;
+                    dst[x] = (BYTE)v;
+                }
+            }
+        }
+
+        out.gm.gmBlackBoxX       = (UINT)boxX;
+        out.gm.gmBlackBoxY       = (UINT)boxY;
+        out.gm.gmptGlyphOrigin.x = originX;
+        out.gm.gmptGlyphOrigin.y = originY;
+        return true;
+    }
+
+    static bool Rasterize(HDC hdc, const std::wstring& text, UINT fuFormat, Entry& out) {
+        HFONT src = (HFONT)GetCurrentObject(hdc, OBJ_FONT);
+        if (!src) return false;
+
+        LOGFONTW lf = {};
+        if (!GetObjectW(src, sizeof(lf), &lf)) return false;
+        lf.lfQuality = (fuFormat == GGO_BITMAP) ? NONANTIALIASED_QUALITY
+                                                : ANTIALIASED_QUALITY;
+
+        if (!EnsureDC()) return false;
+
+        HFONT font = CreateFontIndirectW(&lf);
+        if (!font) return false;
+        HGDIOBJ prevFont = SelectObject(g_dc, font);
+
+        bool ok = false;
+        TEXTMETRICW tm     = {};
+        SIZE        extent = {};
+        if (GetTextMetricsW(g_dc, &tm) &&
+            GetTextExtentPoint32W(g_dc, text.c_str(), (int)text.size(), &extent)) {
+            const int pad    = tm.tmHeight + 8;
+            const int width  = extent.cx + pad * 2;
+            const int height = tm.tmHeight + pad * 2;
+
+            RECT clear = { 0, 0, width, height };
+            if (EnsureBitmap(width, height) &&
+                ExtTextOutW(g_dc, pad, pad, ETO_OPAQUE, &clear,
+                            text.c_str(), (int)text.size(), nullptr)) {
+                ok = Pack(tm, extent.cx, pad, width, height, fuFormat, out);
+            }
+        }
+
+        SelectObject(g_dc, prevFont);
+        DeleteObject(font);
+        return ok;
+    }
+
+    static DWORD Get(HDC hdc, const std::wstring& text, UINT fuFormat,
+                     LPGLYPHMETRICS lpgm, DWORD cjBuffer, void* pvBuffer) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+
+        const uint64_t key = ((uint64_t)(uintptr_t)GetCurrentObject(hdc, OBJ_FONT) << 32)
+                           | (uint64_t)(fuFormat & 0xFF);
+
+        auto& byText = g_cache[key];
+        auto  it     = byText.find(text);
+        if (it == byText.end()) {
+            Entry fresh;
+            if (!Rasterize(hdc, text, fuFormat, fresh)) return GDI_ERROR;
+            it = byText.emplace(text, std::move(fresh)).first;
+        }
+
+        const Entry& e = it->second;
+        if (lpgm) *lpgm = e.gm;
+        if (!pvBuffer || e.bits.empty()) return (DWORD)e.bits.size();
+
+        // The caller sizes its buffer from the font's cell metrics, so a
+        // wide or tall cluster can outgrow it. Copy the rows that fit and
+        // clip the reported box to match, or the caller walks past its end.
+        if (cjBuffer >= e.bits.size()) {
+            memcpy(pvBuffer, e.bits.data(), e.bits.size());
+        }
+        else {
+            memcpy(pvBuffer, e.bits.data(), cjBuffer);
+            if (lpgm && e.rowStride > 0) {
+                DWORD rows = cjBuffer / (DWORD)e.rowStride;
+                if (rows < lpgm->gmBlackBoxY) lpgm->gmBlackBoxY = rows;
+            }
+        }
+        return (DWORD)e.bits.size();
+    }
+
+    static int Advance(HDC hdc, const std::wstring& text, UINT fuFormat) {
+        if (text.size() == 1) {
+            MAT2 mat = {};
+            mat.eM11.value = 1;
+            mat.eM22.value = 1;
+            GLYPHMETRICS gm = {};
+            if (GetGlyphOutlineW(hdc, text[0], fuFormat, &gm, 0, nullptr, &mat) == GDI_ERROR)
+                return -1;
+            if (gm.gmptGlyphOrigin.x < 0) gm.gmCellIncX += (short)(-gm.gmptGlyphOrigin.x);
+            return gm.gmCellIncX;
+        }
+
+        GLYPHMETRICS gm = {};
+        if (Get(hdc, text, fuFormat, &gm, 0, nullptr) == GDI_ERROR) return -1;
+        return gm.gmCellIncX;
+    }
+
+    static void InvalidateForFont(HFONT hf) {
+        if (!hf) return;
+        const uint64_t prefix = (uint64_t)(uintptr_t)hf << 32;
+
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_cache.empty()) return;
+        for (auto it = g_cache.begin(); it != g_cache.end(); ) {
+            if ((it->first & 0xFFFFFFFF00000000ULL) == prefix) it = g_cache.erase(it);
+            else ++it;
+        }
+    }
+
+    static void Release() {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_cache.clear();
+        if (g_dc && g_prevBmp) SelectObject(g_dc, g_prevBmp);
+        if (g_bitmap) { DeleteObject(g_bitmap); g_bitmap = nullptr; }
+        if (g_dc)     { DeleteDC(g_dc);         g_dc     = nullptr; }
+        g_prevBmp = nullptr;
+        g_pixels  = nullptr;
+        g_width   = 0;
+        g_height  = 0;
     }
 }
 
@@ -2085,6 +2391,7 @@ namespace WordWrap {
                 // before deleting it: GDI can reissue the same handle value for
                 // a future font, which would then read stale advances.
                 InvalidateGlyphsForFont(g_measureFont);
+                CharGlyph::InvalidateForFont(g_measureFont);
                 DeleteObject(g_measureFont);
             }
             g_measureFont = nf;
@@ -2261,7 +2568,8 @@ namespace WordWrap {
         int    widthThru;  // line width accumulated through this point
     };
 
-    static std::string WrapPixels(const std::string& sjis, const PrintCtx& ctx, int& linesOut) {
+    static std::string WrapPixels(const std::string& sjis, const PrintCtx& ctx,
+                                  const CharRestore::Map& lost, int& linesOut) {
         int budget = (ctx.rectRight - ctx.rectLeft) - ctx.indent - Config::wrapSafetyPx;
         if (budget <= 0) {
             linesOut = 1;
@@ -2325,7 +2633,10 @@ namespace WordWrap {
             unsigned char trail = dbcs ? (unsigned char)sjis[i + 1] : 0;
             UINT ch = dbcs ? (UINT)((lead << 8) | trail) : (UINT)c;
 
-            int adv = GlyphAdvance(ctx.hdc, ch, ctx.fuFormat);
+            auto rec = lost.find(i);
+            int adv = (rec != lost.end())
+                    ? CharGlyph::Advance(ctx.hdc, rec->second, ctx.fuFormat)
+                    : GlyphAdvance(ctx.hdc, ch, ctx.fuFormat);
             if (adv < 0) adv = ctx.lineHeight / 2;   // missing glyph: approximate
 
             // Would this glyph leave the box?
@@ -2455,7 +2766,8 @@ namespace WordWrap {
         Log("[WRAP]   \"%s\"\n", utf8.c_str());
     }
 
-    std::string WrapForPrint(void* printMgr, const std::string& sjis) {
+    std::string WrapForPrint(void* printMgr, const std::string& sjis,
+                             const CharRestore::Map& lost) {
         if (sjis.empty()) return sjis;
         if (Config::wrapMode == Config::WrapMode::Off) return sjis;
 
@@ -2483,7 +2795,7 @@ namespace WordWrap {
                     }
 
                     int lines = 1;
-                    std::string wrapped = WrapPixels(sjis, ctx, lines);
+                    std::string wrapped = WrapPixels(sjis, ctx, lost, lines);
 
                     if (maxLines > 0 && lines > maxLines) {
                         ReportOverflow(CurrentSceneFile(), t_cmdIndex,
@@ -2852,7 +3164,7 @@ static void __fastcall PrintEx_Hook(
             CharRestore::Find(message, lost);   // registered upstream by say()
         }
 
-        std::string wrapped = WordWrap::WrapForPrint(pThis, sjis);
+        std::string wrapped = WordWrap::WrapForPrint(pThis, sjis, lost);
         if (wrapped != message) {
             finalMsg = g_stringPool.Store(wrapped);
         }
@@ -3345,10 +3657,17 @@ static DWORD WINAPI GetGlyphOutlineA_Hook(
     // and fall back to the other. During a textOut renderer walk, the
     // UxPrintData cursor still holds the position where the last glyph loop
     // stopped, so consulting it there would substitute the wrong character.
-    wchar_t sub = (CharRestore::t_toArmed && CharRestore::t_toBase)
+    const std::wstring* sub = (CharRestore::t_toArmed && CharRestore::t_toBase)
                 ? CharRestore::CharAtTextOut(uChar)
-                : CharRestore::CharAtCursor();
-    if (wchar_t wc = sub) {
+                : CharRestore::CharAtCursor(uChar);
+    if (sub && sub->size() > 1) {
+        HFONT   fb   = JpFallback::ForMissingGlyph(hdc, (*sub)[0]);
+        HGDIOBJ prev = fb ? SelectObject(hdc, fb) : nullptr;
+        result = CharGlyph::Get(hdc, *sub, fuFormat, lpgm, cjBuffer, pvBuffer);
+        if (fb) SelectObject(hdc, prev);
+        return result;
+    }
+    if (wchar_t wc = sub ? (*sub)[0] : L'\0') {
         // Use the DC's current font on purpose: restored characters are the
         // Latin ones Shift-JIS dropped, and the custom face should draw
         // them - unless it has no such glyph, in which case use the
@@ -3415,6 +3734,7 @@ static HFONT WINAPI CreateFontIndirectA_Hook(const LOGFONTA* lf) {
         // and flushing the whole cache each time would make it useless.
         WordWrap::InvalidateGlyphsForFont(created);
         JpFallback::InvalidateForFont(created);
+        CharGlyph::InvalidateForFont(created);
 
         return created;
     }
@@ -4894,6 +5214,7 @@ static void Shutdown() {
     MH_Uninitialize();
     WordWrap::ReleaseMeasureDC();
     JpFallback::Release();
+    CharGlyph::Release();
     UnloadBundledFonts();
 
     if (g_logFile) {
